@@ -1,0 +1,139 @@
+import numpy as np
+from scipy import linalg
+import time
+
+def generate_MU_PHI_sv(x_t, STT, param_macro_MH: dict, priorsMacroGibbs: dict):
+
+    R0_=priorsMacroGibbs["R0_"]
+    T0_=priorsMacroGibbs["T0_"]
+    R0_M=priorsMacroGibbs["R0_M"]
+    T0_M=priorsMacroGibbs["T0_M"]
+    D0_=priorsMacroGibbs["D0_"]
+    V0_=priorsMacroGibbs["V0_"]
+
+    paramMU = param_macro_MH['paramMU']
+    mu_0 = paramMU[0, 0]
+    mu_1 = paramMU[1, 0]
+    Sigma2_0_cc = param_macro_MH['Sigma2_0_cc']
+    h_cc = param_macro_MH['h_cc']
+    T = len(x_t)
+
+    mu_t = mu_0 + mu_1 * STT
+    sigma2_t = Sigma2_0_cc * (1 + h_cc * STT)   
+
+    #### Generate PHI
+    tt0 = time.time()
+    x_t = np.asmatrix(x_t).T
+    Ystar = x_t - mu_t  
+    Xstar = Ystar[3:-1, 0]  
+    Ystar = Ystar[4:, 0]
+    sigma_t = np.asmatrix(sigma2_t[4:, 0] ** 0.5).T 
+
+    Xstar = Xstar / np.tile(sigma_t, (1, Xstar.shape[1]))  
+    Ystar = Ystar / sigma_t 
+
+    V = linalg.solve(R0_ + (Xstar.T @ Xstar), np.eye(1))[0, 0]
+    PHI = V * (R0_ * T0_ + Xstar.T @ Ystar)
+    C = linalg.cholesky(V, lower=False)
+
+    PHI_G = (PHI + C.T @ np.random.standard_normal((1, 1)))[0, 0]
+    phi_cc = PHI_G
+    tt1 = time.time()
+    print("PHI, time:", tt1 - tt0)
+    ##########################
+    # Generate MU_0 and MU_1 #
+    ##########################
+    # Kim (1999) section 9.1.3
+    # Step 3.3.2 in the thesis
+
+    tt0 = time.time()
+
+    Ystar = x_t[4:, 0] - PHI_G * x_t[3:-1, 0]
+    Xstar = np.hstack((np.ones((T - 4, 1)), np.asmatrix(STT[4:, 0] - PHI_G * STT[3:-1, 0]).T))
+ 
+    Ystar = Ystar / sigma_t
+    # Ystar is Z^* in the thesis
+    Xstar = Xstar / np.tile(sigma_t, (1, Xstar.shape[1]))
+    # Xstar stacks x_{0t} and x_{1t} (as defined in the thesis)
+
+    V = linalg.solve(R0_M + (Xstar.T @ Xstar), np.eye(2))  # (B_0^{-1} + X*^TX*)^{-1} - eq from the thesis and Kim (1999)
+    b1 = V @ (R0_M @ T0_M + Xstar.T @ Ystar)  # V @ (B_0^{-1}@b_0 + X*^T @ Z* ) - eq from the thesis and Kim (1999)
+    B1_sq = linalg.cholesky(V, lower=False)   # sqrt(B_1)
+
+    accept = 0
+
+    while accept == 0:
+        MU_G = b1 + B1_sq.T  @ np.random.standard_normal((2, 1))
+        if MU_G[1, 0] > 0:   
+            accept = 1
+    # Bad coding: insert some kind of stopping in case there is a mistake and while loop continues 
+
+    MU_G[0, 0] = MU_G[0, 0] / (1 - PHI_G)
+    mu_0 = MU_G[0, 0]
+    mu_1 = MU_G[1, 0]
+    paramMU = np.asmatrix([mu_0, mu_1]).T
+
+    tt1 = time.time()
+    print("MU, time:", tt1 - tt0)
+
+    ##########################
+    ##   Generate Sigma2_0  ##
+    ##########################
+    # Kim (1999) section 9.1.4
+    # Step 3.3.3 in the thesis
+
+    mu_t = mu_0 + mu_1 * STT
+    Ystar = x_t - mu_t
+
+    tempDenominator = (1 + h_cc * STT[4:]) ** 0.5
+    e_mat = Ystar[4:, 0] - PHI_G * Ystar[3:-1, 0]
+    e_mat = e_mat / tempDenominator
+
+    Tstar = len(e_mat)
+    c_1 = Tstar + V0_            # nu_1 in Kim (1999), page 217
+    C_1 = D0_ + e_mat.T @ e_mat  # delta_1 in Kim (1999), page 217
+
+    # Compute draw of sigma_0^2 from the inverse gamma
+    temp = linalg.cholesky(linalg.solve(C_1, np.eye(1)), lower=True) @ np.random.standard_normal((1, c_1))
+    # linalg.cholesky "transforms" from variance to std, so we can multiply w. N(0,1)
+    Sigma2_0_cc = linalg.solve((temp @ temp.T), np.eye(1))
+
+    ##########################
+    ##     Generate h_cc    ##
+    ##########################
+    # Kim (1999) section 9.1.4, page 218
+    # Step 3.3.4 in the thesis
+
+    tt0 = time.time()
+    mu_t = mu_0 + mu_1 * STT
+    Ystar = x_t - mu_t
+    e_mat = Ystar[4:, 0] - PHI_G * Ystar[3:-1, 0]
+    tempDenominator = Sigma2_0_cc ** 0.5
+    e_mat = e_mat / tempDenominator
+
+    tempIndex = STT[4:].astype(bool)  # returns True if STT is non-zero and False if zero
+    e_mat = np.asarray(e_mat)
+    e_mat = e_mat[tempIndex]
+
+    Tstar = len(e_mat)
+    nn = Tstar + V0_
+    d = D0_ + e_mat.T @ e_mat
+
+    accept = 0
+    while accept == 0:
+        # compute draw from the inverse gamma distribution
+        temp = linalg.cholesky(linalg.solve(d, np.eye(1)), lower=True) @ np.random.standard_normal((1, nn))
+        h_hat = linalg.solve(temp @ temp.T, np.eye(1))
+        print(h_hat)
+        if h_hat > 2/3:   
+            accept = 1
+        # bad coding: incorporate some kind of safety stop in case there is a mistake in the code and loop never stops
+        
+    h_cc = h_hat - 1
+    tt1 = time.time()
+    print("h_cc, time:", tt1 - tt0)
+
+    h_cc = 0  # set to zero if equal macro vol shocks across regimes
+    Sigma2_0_cc = 1   # normalize 
+
+    return phi_cc, paramMU, Sigma2_0_cc, h_cc
