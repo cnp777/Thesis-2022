@@ -1,0 +1,150 @@
+import numpy as np
+from sklearn.linear_model import LinearRegression
+import statsmodels.api as sm
+import numpy.ma as ma
+
+## Initial values macro begins:
+s_t = 1 * (~np.array(NBERIndex, dtype=bool))
+# multiply with 1 to transform from True/False vector to 1/0 vector
+
+x_t = np.nanmean(yy_monthly, axis=1) / np.std(np.nanmean(yy_monthly, axis=1))  # row-wise mean by axis=1
+
+gamma_macro_m = np.zeros(shape=((N_m + 3), 1))  
+e_t = np.zeros(shape=(T, N_m))
+
+for i in range(0, N_m - 1):
+    result = sm.OLS(yy_monthly[:, i], x_t, missing='drop').fit()
+    # no intercept as data is expected to be centered, i.e. already standardized
+    # See here how Matlab handles NaNs so that we do it in the same way:
+    # https://www.mathworks.com/matlabcentral/answers/366453-how-does-regress-deal-with-nan
+    gamma_macro_m[i] = result.params[0]
+    e_t[:, i] = yy_monthly[:, i] - result.params[0] * x_t
+    # Raw residuals: observed value - predicted value
+
+Xaux = np.stack([x_t[3:-1], x_t[2:-2], x_t[1:-3], x_t[0:-4]], axis=1)
+Yaux = yy_monthly[4:, -1]
+result = sm.OLS(Yaux, Xaux, missing='drop').fit()
+gamma_macro_last = result.params
+rawresid = Yaux - result.params @ Xaux.T
+# raw residuals: observed value - fitted value
+
+empty = np.asarray([np.nan for _ in range(0, 4)])
+e_t[:, -1] = np.concatenate((empty, rawresid))
+gamma_macro_m[-4:] = np.asmatrix(gamma_macro_last).T
+
+## Next: compute psi_macro_m and SIG2_i_macro_m
+psi_macro_m = np.zeros(shape=(1, N_m))
+SIG2_i_macro_m = np.zeros(shape=(N_m, 1))
+
+for j in range(0, N_m):  # j = 0, 1, ..., N_m-1
+    e_select = e_t[:, j]  # j'th column
+    e_select = e_select[~np.isnan(e_select)]  # use only non NaN values
+    result = sm.OLS(e_select[1:], e_select[0:-1], missing='drop').fit()
+    rawresid = e_select[1:] - result.params[0] * e_select[0:-1]
+    psi_macro_m[:, j] = result.params[0]
+    SIG2_i_macro_m[j] = np.nanmean(rawresid ** 2)
+
+### Calculate the quarterly macro variables
+gamma_macro_q = np.zeros(shape=(N_q, 1))
+e_t = np.zeros(shape=(T, N_q))
+
+for l in range(0, N_q):
+    result = sm.OLS(yy_quarterly[:, l], x_t, missing='drop').fit()
+    # no intercept as data is expected to be centered, i.e. already standardized
+    gamma_macro_q[l] = result.params[0]
+    e_t[:, l] = yy_quarterly[:, l] - result.params[0] * x_t
+
+# e_t = psi_1 e_{t-1}  + epsilon_t
+psi_macro_q = np.zeros(shape=(1, N_q))
+SIG2_i_macro_q = np.zeros(shape=(N_q, 1))
+
+for k in range(0, N_q):  # j = 0, 1, ..., N_q-1
+    e_select = e_t[:, k]  # k'th column
+    e_select = e_select[~np.isnan(e_select)]  # use only non NaN values
+    result = sm.OLS(e_select[1:], e_select[0:-1], missing='drop').fit()
+    psi_macro_q[:, k] = result.params[0]
+    residuals = e_select[1:] - result.params[0] * e_select[0:-1]
+    SIG2_i_macro_q[k] = np.nanmean(residuals ** 2)
+
+param_macro_MH = dict()
+param_macro_gibbs = dict()
+
+param_macro_gibbs['gamma_macro_m'] = gamma_macro_m
+param_macro_gibbs['psi_macro_m'] = psi_macro_m
+param_macro_gibbs['SIG2_i_macro_m'] = SIG2_i_macro_m
+param_macro_gibbs['gamma_macro_q'] = gamma_macro_q
+param_macro_gibbs['psi_macro_q'] = psi_macro_q
+param_macro_gibbs['SIG2_i_macro_q'] = SIG2_i_macro_q
+
+### Calculate variables associated with the common component
+
+result = sm.OLS(x_t[1:], x_t[0:-1], missing='drop').fit()
+phi_macro = result.params[0]
+phi_cc = phi_macro
+paramMU = [-2, 2.5]
+paramPHI = phi_macro
+Sigma2_0_cc = 1
+
+### Calculate transition probabilities
+# p and q are drawn from a beta distribution. (Kim 1999 page 215)
+
+states = [0, 1]
+transition_matrix = generate_ChangeState(s_t[4:], states)
+
+A1TT = np.random.beta(transition_matrix[0, 1] + U1_01_, transition_matrix[0, 0] + U1_00_)  # 0 -> 1
+B1TT = np.random.beta(transition_matrix[1, 0] + U1_10_, transition_matrix[1, 1] + U1_10_)  # 0 -> 1,
+
+paramProb = np.asmatrix([A1TT, B1TT]).T
+
+param_macro_MH['paramProb'] = paramProb
+param_macro_MH['phi_cc'] = phi_macro
+param_macro_MH['Sigma2_0_cc'] = 1  # standardized
+param_macro_MH['paramMU'] = np.asmatrix([-2, 2.5]).T
+param_macro_MH['h_cc'] = -0.3
+
+### The next dictionary; param_macro_gibbs
+
+indexNaN = np.isnan(yy_monthly).astype(int)
+# returns array with True if NaN and False if not
+# astype(int) turns it into True=1 and False=0
+perNaN = np.sum(indexNaN, axis=0) / yy_monthly.shape[0]
+# returns a row vector of the sums of each column
+# Percent of NaNs in each column, i.e. for each macro variable
+perNaNExclude = perNaN > 0.99
+# returns a vector with True if column has more than 99% NaNs and False if not
+indexVars = np.asarray([x for x in range(0, yy_monthly.shape[1])])
+indexVars = indexVars[~perNaNExclude]
+# Only include the columns with False
+yy_monthly = yy_monthly[:, ~perNaNExclude]
+
+SIG2_i_macro_m = SIG2_i_macro_m[~perNaNExclude]
+psi_macro_m = psi_macro_m[:, ~perNaNExclude.T]
+
+indexGamma_macro = np.append(~perNaNExclude, [True, True, True])
+gamma_macro_m = gamma_macro_m[indexGamma_macro]
+
+# save monthly estimates
+param_macro_gibbs['gamma_macro_m'] = gamma_macro_m
+param_macro_gibbs['psi_macro_m'] = psi_macro_m.T
+param_macro_gibbs['SIG2_i_macro_m'] = SIG2_i_macro_m
+
+# Quarterly data
+indexNaN = np.isnan(yy_quarterly).astype(int)
+perNaN = np.sum(indexNaN, axis=0) / yy_quarterly.shape[0]
+perNaNExclude = perNaN > 0.8
+indexVars = np.asarray([x for x in range(0, yy_quarterly.shape[1])])
+indexVars = indexVars[~perNaNExclude]
+
+yy_quarterly = yy_quarterly[:, ~perNaNExclude]
+
+SIG2_i_macro_q = SIG2_i_macro_q[~perNaNExclude]
+psi_macro_q = psi_macro_q[:, ~perNaNExclude.T]
+gamma_macro_q = gamma_macro_q[~perNaNExclude]
+
+param_macro_gibbs['gamma_macro_q'] = gamma_macro_q
+param_macro_gibbs['psi_macro_q'] = psi_macro_q.T
+param_macro_gibbs['SIG2_i_macro_q'] = SIG2_i_macro_q
+
+T = np.shape(yy_monthly)[0]
+N_m = np.shape(yy_monthly)[1]
+N_q = np.shape(yy_quarterly)[1]
