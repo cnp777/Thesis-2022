@@ -1,0 +1,202 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from datetime import datetime
+from fredapi import Fred
+
+
+# Load data
+macro_df = pd.read_csv('macro_5001_2210_fred_40000s.csv')
+macro_df.index = [pd.to_datetime(date, format='%Y-%m-%d').date() for date in macro_df['Unnamed: 0']]
+macro_df = macro_df.drop('Unnamed: 0', axis=1)
+
+mut_df = pd.read_csv('mut5022_fred25000s_2.csv')
+mut_df.index = [pd.to_datetime(date, format='%Y-%m-%d').date() for date in mut_df['Unnamed: 0']]
+mut_df = mut_df.drop('Unnamed: 0', axis=1)
+
+jof_plotstart = pd.to_datetime("1965-01-01", format='%Y-%m-%d')
+startdate_erm = macro_df.index[0]  # pd.to_datetime('1965-01-01', format='%Y-%m-%d')
+enddate_erm = macro_df.index[-1]
+
+############################################
+####      Load NBER recession data      ####
+############################################
+fred = Fred(api_key='input_personal_api')
+rec_data = fred.get_series('USREC', observation_start=startdate_erm, observation_end=enddate_erm)
+
+#################################
+##   Create State indicators   ##
+#################################
+
+# Get unemployment and nairu data
+unrate_data = fred.get_series("UNRATE", observation_start=startdate_erm, observation_end=enddate_erm)
+unrate_data.name = 'unemployment_rate'
+NROU_data = fred.get_series("NROU", observation_start=startdate_erm, observation_end=enddate_erm)
+NROU_data.name = 'nairu Q'
+# Resample from quarterly to monthly:
+NROU_m = NROU_data.resample('M').mean()  # Creates NaN values in the missing months
+NROU_m = NROU_m.interpolate()  # Fills the NaNs linearly by interpolate
+# Date are at the end of the month but unrate is beginning of month.
+NROU_m.index = NROU_m.index + pd.offsets.MonthBegin(1)  # Moves to the first of next month
+NROU_m.name = 'nairu M'
+# Create slack indicator
+slack_data = NROU_m - unrate_data
+slack_data.name = 'slack: nairuM - unemployment'
+slack_indicator = 1 * (slack_data < 0)
+
+recession = 1 * ((slack_data < 0) * rec_data.astype(bool))
+latecycle = 1 * ((slack_data < 0) * ~rec_data.astype(bool))
+expansion = 1 * ((slack_data > 0) * ~rec_data.astype(bool))
+rollover = 1 * ((slack_data > 0) * rec_data.astype(bool))
+
+########################################
+####     Computation time plots     ####
+########################################
+
+comp_times = pd.read_csv('macro_computation_time_df_40000s.csv')
+comp_times = comp_times.drop('Unnamed: 0', axis=1)
+
+comp_times.rename(columns={'full loop': 'Full loop', 'sims_cc': 'Common Component', 'sims_fltPR': 'Filt. Rec. Prob.', 'sims_gibbs_m': 'Gibbs (monthly)', 'sims_gibbs_q': 'Gibbs (quarterly)', 'sims_macroparams': 'Macro params', 'sims_pq': 'p and q'}, inplace=True)
+
+CompTimeText = "Average computation times" + '\n\n'
+
+with plt.style.context('_classic_test_patch'):
+    for column in list(comp_times.columns.values):
+        plt.plot(comp_times[column], alpha=0.3, label=column)
+        CompTimeText += str(column) + ': ' + str(round(comp_times[column].mean(), 4)) + '\n'
+
+    plt.ylabel("Computation time (seconds)")
+    plt.xlabel("Simulation")
+    plt.ylim(0, 60)
+    plt.hlines(y=comp_times['Full loop'].mean(), xmin=0, xmax=40000, color="black", linestyles="--", label="Full loop average")
+    plt.legend(frameon=True, loc='upper left', ncol=4)
+    plt.text(30000, 40, CompTimeText, fontsize=7,
+             bbox=dict(facecolor='white', alpha=0.6))
+    plt.show()
+
+
+############################################
+####     Recession probability plot     ####
+############################################
+
+ax = (macro_df['Recession_prob_filtered_mean'] * 100).plot(color="navy")
+(rec_data * 100).plot.area(ax=ax, figsize=(8, 5), x='DATE', alpha=0.2, color="gray")
+plt.xlim(startdate_erm-pd.Timedelta("1 day"), enddate_erm + pd.Timedelta("1 day"))
+# plt.title("Probability for a recessionary regime")
+plt.ylabel('Percentage')
+plt.hlines(y=50, xmin=startdate_erm - pd.Timedelta("1 day"), xmax=enddate_erm + pd.Timedelta("1 day"), linestyles='--',
+           colors='black')
+plt.fill_between(
+    x=macro_df.index,
+    y1=macro_df['Recession_prob_filtered_mean'] * 100,  # transform from probability to percentage plot
+    color="navy",
+    alpha=0.7)
+# fix the date interval
+ax.xaxis.set_major_locator(mdates.YearLocator(base=5))
+ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+plt.gcf().autofmt_xdate()
+plt.show()
+
+############################################
+####     expected excess return plot     ###
+############################################
+mean_excess_return = 7.899724137931035   # (= 6.131771595900438 for the sample starting in 65) # = np.mean(YY)*1200 (calculated in ERM_main.py)
+
+# plt.title("One-month-ahead excess return forecast")
+ax = mut_df['forecast_expected_returns'].plot(color="navy", label="Expected Excess Return")
+mut_df['CMA'].plot(color='dodgerblue', label="Cumulative Moving Average")
+(rec_data * 30).plot.area(ax=ax, figsize=(8, 5), x='DATE', alpha=0.2, color="gray", label='_nolegend_')
+(rec_data * (-20)).plot.area(ax=ax, figsize=(8, 5), x='DATE', alpha=0.2, color="gray", label='_nolegend_')
+plt.fill_between(x=mut_df.index, y1=mut_df['lower_q'], y2=mut_df['upper_q'], color="navy", alpha=0.3)
+plt.xlim(jof_plotstart, enddate_erm + pd.Timedelta("1 day"))
+plt.ylim(-20, 25)
+plt.ylabel('Percentage per year')
+plt.hlines(y=0, xmin=jof_plotstart, xmax=enddate_erm + pd.Timedelta("1 day"), color='black', alpha=0.5)
+plt.hlines(y=mean_excess_return, xmin=jof_plotstart, xmax=enddate_erm + pd.Timedelta("1 day"), colors='black', linestyles='--',
+           label="Mean excess return (in-sample)")
+ax.xaxis.set_major_locator(mdates.YearLocator(base=5))
+ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+plt.gcf().autofmt_xdate()
+plt.legend(frameon=True, loc='upper right', facecolor='white')
+plt.show()
+
+
+############################################
+####    common component growth plot     ###
+############################################
+
+# make df with moving averages
+zt_df = pd.DataFrame({'common_growth': macro_df['Common_growth_component_median']}, index=macro_df.index)
+zt_df['MA20'] = zt_df.rolling(window=20).mean()
+zt_df['diff'] = zt_df['common_growth'] - zt_df['MA20']
+zt_df['MA24'] = zt_df['common_growth'].rolling(window=24).mean()
+zt_df['MA12'] = zt_df['common_growth'].rolling(window=12).mean()
+zt_df['MA6'] = zt_df['common_growth'].rolling(window=6).mean()
+
+ax1 = zt_df['common_growth'].plot(color='dodgerblue', alpha=0.6, figsize=(8, 5), x='DATE',
+                                  label="Common Growth Component")
+zt_df['MA20'].plot(color='black', alpha=0.8, figsize=(8, 5), x='DATE', label='20 months MA')
+(rec_data * 4).plot.area(ax=ax1, figsize=(8, 5), x='DATE', alpha=0.2, color="grey", label='_nolegend_')
+(rec_data * (-5)).plot.area(ax=ax1, figsize=(8, 5), x='DATE', alpha=0.2, color="grey", label='_nolegend_')
+plt.hlines(y=0, xmin=startdate_erm, xmax=enddate_erm + pd.Timedelta("1 day"), linestyles='--', colors='black')
+plt.xlim(startdate_erm, enddate_erm + pd.Timedelta("1 day"))
+plt.ylim(-4, 4)
+plt.legend(frameon=True, loc='lower center', ncol=3)
+ax1.xaxis.set_major_locator(mdates.YearLocator(base=5))
+ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+plt.gcf().autofmt_xdate()
+plt.show()
+
+#### Common Growth Component Moving averages
+ax1 = zt_df['MA12'].plot(color='navy', alpha=0.6, figsize=(8, 5), x='DATE', label='12 months')
+# zt_df['MA24'].plot(color='black', alpha=0.6, figsize=(8, 5), x='DATE', label="24 months")
+zt_df['MA6'].plot(color='forestgreen', alpha=0.6, figsize=(8, 5), x='DATE', label='6 months')
+(rec_data * 4).plot.area(ax=ax1, figsize=(8, 5), x='DATE', alpha=0.2, color="grey", label='_nolegend_')
+(rec_data * (-5)).plot.area(ax=ax1, figsize=(8, 5), x='DATE', alpha=0.2, color="grey", label='_nolegend_')
+plt.hlines(y=0, xmin=startdate_erm, xmax=enddate_erm + pd.Timedelta("1 day"), linestyles='--', colors='black')
+plt.xlim(startdate_erm, enddate_erm + pd.Timedelta("1 day"))
+plt.ylim(-3, 2)
+# plt.title("Common Growth Component Moving Averages")
+plt.legend(frameon=True, loc='lower center', ncol=3)
+ax1.xaxis.set_major_locator(mdates.YearLocator(base=5))
+ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+plt.gcf().autofmt_xdate()
+plt.show()
+
+
+########################
+# Posterior Trace plot #
+########################
+erm_trace_csv = pd.read_csv('erm_trace5019_jof25000s.csv')
+
+erm_trace = {'mu_l': erm_trace_csv['mu_l'],
+             'rho_l': erm_trace_csv['rho_l'],
+             'corr_s': erm_trace_csv['corr_s'],
+             'phi_exp': erm_trace_csv['phi_1'],
+             'phi_rec': erm_trace_csv['phi_2'],
+             'h': erm_trace_csv['h'],
+             'sigma2_0': erm_trace_csv['sigma2_1']}
+
+erm_trace1 = {
+    'corr_s': erm_trace_csv['corr_s'],
+    'phi_exp': erm_trace_csv['phi_1'],
+    'phi_rec': erm_trace_csv['phi_2']}
+
+erm_trace2 = {'mu_l': erm_trace_csv['mu_l'],
+              'rho_l': erm_trace_csv['rho_l'],
+              'h': erm_trace_csv['h']}
+
+import arviz as az
+
+print(az.summary(erm_trace, kind="stats", round_to=6))
+az.style.use(["arviz-whitegrid", "arviz-orangish"])
+
+az.plot_trace(erm_trace)
+plt.show()
+
+az.style.use(["arviz-white", "arviz-orangish"])
+az.plot_posterior(erm_trace1)
+az.plot_posterior(erm_trace2)
+plt.show()
+
