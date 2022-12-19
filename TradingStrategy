@@ -1,0 +1,926 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from datetime import date, datetime
+import statsmodels.formula.api as sm
+from stargazer.stargazer import Stargazer
+from scipy import stats
+
+
+## Helper function to adjust Fama French dates:
+def int2date(argdate: int):
+    """https://stackoverflow.com/questions/9750330/how-to-convert-integer-into-date-object-python"""
+    argdate = int(str(argdate) + "01")
+    year = int(argdate / 10000)
+    month = int((argdate % 10000) / 100)
+    day = int(argdate % 100)
+    return date(year, month, day)
+
+
+# Get the common component and the filtered probability of recession, pi_{t|t}
+macro_df = pd.read_csv('macro_5001_2210_fred_40000s.csv')  # 840, 1950-01-31 to 2019-12-31 (JoF data)
+macro_df.index = [pd.to_datetime(date, format='%Y-%m-%d').date() for date in macro_df['Unnamed: 0']]
+macro_df = macro_df.drop('Unnamed: 0', axis=1)
+
+# Get the expected excess return forecast
+mut_df = pd.read_csv('mut5022_fred25000s_2.csv')
+mut_df.index = [pd.to_datetime(date, format='%Y-%m-%d').date() for date in mut_df['Unnamed: 0']]
+mut_df = mut_df.drop('Unnamed: 0', axis=1)
+
+## Extract start and end dates
+start_date = pd.to_datetime(mut_df.index[0], format='%Y-%m-%d')  # pd.to_datetime('1980-01-01', format='%Y-%m-%d')
+end_date = pd.to_datetime(mut_df.index[-1], format='%Y-%m-%d')
+index_erm = mut_df.index
+
+# If 2022 data, then lengths differ, mut_df ends already 2022-08-31
+macro_df = macro_df.loc[(macro_df.index <= mut_df.index[-1])]
+
+start_jof_strategy = pd.to_datetime('1980-01-01', format='%Y-%m-%d')
+start_date_strategy = pd.to_datetime('1985-01-01', format='%Y-%m-%d')  # start_jof_strategy
+dates_s = pd.date_range(start=start_date_strategy, end=end_date, freq='M').strftime('%Y-%m-%d')
+index_strategy = [pd.to_datetime(date, format='%Y-%m-%d').date() for date in dates_s if
+                  pd.to_datetime(date, format='%Y-%m-%d').date() in index_erm]
+
+# Define data frames
+pi_df = pd.DataFrame({'RecessionProbFlt': macro_df['Recession_prob_filtered_median']}, index=macro_df.index)
+zt_df = pd.DataFrame({'common_growth': macro_df['Common_growth_component_median']}, index=macro_df.index)
+zt_df['MA20'] = zt_df.rolling(window=20).mean()
+zt_df['diff'] = zt_df['common_growth'] - zt_df['MA20']
+zt_df['MA12'] = zt_df['common_growth'].rolling(window=12).mean()
+
+# Load the Kenneth French data (csv file has excess return as 1st column and RF as 4th)
+# https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/Data_Library/f-f_factors.html
+# https://stackoverflow.com/questions/30716050/convert-kenneth-french-data-to-daily-datetime-format-in-python
+french_df = pd.read_csv('F-F_Research_Data_Factors.csv')
+
+french_df.index = [int2date(date) for date in french_df['Unnamed: 0']]
+french_df.index = pd.to_datetime(french_df.index)
+french_df = french_df.resample('M').last()
+french_df.index = [pd.to_datetime(date, format='%Y-%m-%d').date() for date in french_df.index]
+french_df_erm = french_df.loc[(french_df.index >= index_erm[0]) & (french_df.index <= index_erm[-1])]
+
+# remove the covid dates, this code ensures that if macro dataframe is until 2019, there wont be error
+removedate1 = datetime.strptime('2020-03-31', '%Y-%m-%d').date()
+removedate2 = datetime.strptime('2020-11-30', '%Y-%m-%d').date()
+dates_to_remove = pd.date_range(start=removedate1, end=removedate2, freq='M')
+french_df_erm = french_df_erm.drop(dates_to_remove, errors='ignore')
+
+excess_market_return = french_df_erm['Mkt-RF'] / 100  # returnData['marketReturn_excess']
+Tbill = french_df_erm['RF'] / 100  # returnData['marketRF']
+
+# Create data frame of excess market return in order to get 12-month moving average
+excess_return_df = pd.DataFrame({'excess_market_return': excess_market_return}, index=index_erm)
+excess_return_df['MA'] = excess_return_df.rolling(window=12).mean()
+excess_return_df['diff'] = excess_return_df['excess_market_return'] - excess_return_df['MA']
+excess_return_df['logreturns'] = np.log(1+excess_market_return)
+print(sum(np.isnan(excess_return_df['logreturns'])))
+
+# Adjust data frames to be used in strategy. Edit the starting values to match the beginning of the strategy.
+french_df_ss = french_df_erm.loc[(french_df_erm.index >= start_date_strategy)]
+# so that it matches the dates where we perform our strategy (ss = strategy start)
+excess_market_return_adj = french_df_ss['Mkt-RF'] / 100
+Tbill_adj = french_df_ss['RF'] / 100
+
+zt_df_adj = zt_df.loc[(zt_df.index >= start_date_strategy)]
+pi_df_adj = pi_df.loc[(pi_df.index >= start_date_strategy)]
+mut_df_adj = mut_df.loc[(mut_df.index >= start_date_strategy)]
+macro_df_adj = macro_df.loc[(macro_df.index >= start_date_strategy)]
+excess_return_df_adj = excess_return_df.loc[(excess_return_df.index >= start_date_strategy)]
+
+
+#################################################
+# Strategy conditioned on common component only #
+#################################################
+strategy_return = np.asarray(excess_market_return_adj[0])
+stocks = np.asarray([1])
+
+for i in range(1, len(excess_market_return_adj)):
+    if zt_df_adj['diff'][i - 1] < 0:
+        strategy_return = np.append(strategy_return, Tbill_adj[i])
+        stocks = np.append(stocks, 0)
+    else:
+        strategy_return = np.append(strategy_return, excess_market_return_adj[i])
+        stocks = np.append(stocks, 1)
+
+# Adjust for transaction cost:
+changePF = np.insert(stocks[:-1] != stocks[1:], 0,
+                     False)  # put False as first, so we can compare with buy-and-hold strategy
+strategy_return = strategy_return - 0.002 * np.array(changePF)
+
+# Make dataframe for plotting
+strategy_return_df = pd.DataFrame(data=strategy_return, index=index_strategy, columns=['strategy_return'])
+strategy_return_df['cumulative_returns'] = np.cumsum(strategy_return_df['strategy_return'])
+
+############################################################################
+# Strategy conditioned on the 1-month-ahead forecast of excess return
+############################################################################
+forecast_strategy_return = np.asarray(excess_market_return_adj[0])
+forecast_stocks = np.asarray([1])
+
+for i in range(1, len(excess_market_return_adj)):
+    if mut_df_adj['forecast_expected_returns'][i] < mut_df_adj['CMA'][i - 1]:
+        forecast_strategy_return = np.append(forecast_strategy_return, Tbill_adj[i])
+        forecast_stocks = np.append(forecast_stocks, 0)
+    else:
+        forecast_strategy_return = np.append(forecast_strategy_return, excess_market_return_adj[i])
+        forecast_stocks = np.append(forecast_stocks, 1)
+
+# Adjust for transaction cost:
+changePF_f = np.insert(forecast_stocks[:-1] != forecast_stocks[1:], 0, False)
+forecast_strategy_return = forecast_strategy_return - 0.002 * np.array(changePF_f)
+
+# Make dataframe
+forecast_strategy_df = pd.DataFrame(data=forecast_strategy_return, index=index_strategy,
+                                    columns=['forecast_strategy_return'])
+forecast_strategy_df['cumulative_returns'] = np.cumsum(forecast_strategy_df['forecast_strategy_return'])
+
+#############################################################################################
+#  Strategy w common component is below 12-month MA and excess return forecast is below CMA #
+#############################################################################################
+forecast_probs_return = np.asarray(excess_market_return_adj[0])
+forecast_probs_stocks = np.asarray([1])
+
+# Strategy loop
+for i in range(1, len(excess_market_return_adj)):
+    if zt_df_adj['diff'][i - 1] < 0 and mut_df_adj['forecast_expected_returns'][i] < mut_df_adj['CMA'][
+        i - 1]:  # i-1 so we don't have look ahead bias
+        forecast_probs_return = np.append(forecast_probs_return, Tbill_adj[i])
+        forecast_probs_stocks = np.append(forecast_probs_stocks, 0)
+    else:
+        forecast_probs_return = np.append(forecast_probs_return, excess_market_return_adj[i])
+        forecast_probs_stocks = np.append(forecast_probs_stocks, 1)
+
+# Adjust for transaction cost:
+changePF_fr = np.insert(forecast_probs_stocks[:-1] != forecast_probs_stocks[1:], 0, False)
+forecast_probs_return = forecast_probs_return - 0.002 * np.array(changePF_fr)
+
+# Make dataframe
+forecast_probs_df = pd.DataFrame(data=forecast_probs_return, index=index_strategy, columns=['forecast_probs_return'])
+forecast_probs_df['cumulative_returns'] = np.cumsum(forecast_probs_df['forecast_probs_return'])
+
+
+##########################
+##   State indicators   ##
+##########################
+from fredapi import Fred
+
+fred = Fred(api_key='a3407b8c0abbc6892335e2b2a4612255')
+
+##### Get NBER recession data
+rec_data = fred.get_series('USREC', observation_start=index_erm[0], observation_end=index_erm[-1])
+rec_data = rec_data.resample('M').last()  # resample to last day of the month
+
+##### Get unemployment and nairu data
+unrate_data = fred.get_series("UNRATE", observation_start=index_erm[0],
+                              observation_end=index_erm[-1] + pd.Timedelta("1 day"))
+unrate_data.name = 'unemployment_rate'
+NROU_data = fred.get_series("NROU", observation_start=index_erm[0],
+                            observation_end=index_erm[-1] + pd.Timedelta("1 day"))
+NROU_data.name = 'nairu Q'
+# Resample from quarterly to monthly:
+NROU_m = NROU_data.resample('M').mean()  # Creates NaN values in the missing months
+NROU_m = NROU_m.interpolate()  # Fills the NaNs linearly by interpolate
+# Date are at the end of the month but unrate is beginning of month.
+unrate_data.index = unrate_data.index - pd.Timedelta("1 day")
+NROU_m.index = NROU_m.index  # + pd.offsets.MonthBegin(1)  # Moves to the first of next month
+NROU_m.name = 'nairu M'
+# Create slack indicator
+slack_data = NROU_m - unrate_data
+slack_data.name = 'slack: nairuM - unemployment'
+slack_indicator = 1 * (slack_data < 0)
+#print()
+#print("slack_data", slack_data.info)
+#print("rec_data", rec_data.info)
+#print()
+recession = ((slack_data < 0) * rec_data.astype(bool))
+latecycle = ((slack_data < 0) * ~rec_data.astype(bool))
+expansion = ((slack_data > 0) * ~rec_data.astype(bool))
+rollover = ((slack_data > 0) * rec_data.astype(bool))
+
+##################################
+##    Cumulative Return Plot    ##
+##################################
+
+# Sharpe ratios
+strategy_return_df['SharpeRatio'] = (strategy_return_df['strategy_return'].mean() * 12) / (
+        strategy_return_df['strategy_return'].std() * np.sqrt(12))
+excess_return_df_adj['SharpeRatio'] = (excess_return_df_adj['excess_market_return'].mean() * 12) / (
+        excess_return_df_adj['excess_market_return'].std() * np.sqrt(12))
+forecast_strategy_df['SharpeRatio'] = (forecast_strategy_df['forecast_strategy_return'].mean() * 12) / (
+        forecast_strategy_df['forecast_strategy_return'].std() * np.sqrt(12))
+forecast_probs_df['SharpeRatio'] = (forecast_probs_df['forecast_probs_return'].mean() * 12) / (
+        forecast_probs_df['forecast_probs_return'].std() * np.sqrt(12))
+
+SharpeText = 'Annualized Sharpe Ratios' + '\n\n' + 'Combined Timing: ' + str(
+    round(forecast_probs_df['SharpeRatio'][0] * 100, 2)) + '%' + '\n' + 'Macro Timing: ' + str(
+    round(strategy_return_df['SharpeRatio'][0] * 100, 2)) + '%' + '\n' + 'Return Timing: ' + str(
+    round(forecast_strategy_df['SharpeRatio'][0] * 100, 2)) + '%' + '\n' + 'Buy-and-hold: ' + str(
+    round(excess_return_df_adj['SharpeRatio'][0] * 100, 2)) + '%'
+
+# Time spent in stocks
+StockText = 'Time spent invested in stocks' + '\n\n' + 'Combined Timing: ' + str(
+    round(sum(forecast_probs_stocks) / len(forecast_probs_stocks) * 100, 2)) + '%' + '\n' + 'Macro Timing: ' + str(
+    round(sum(stocks) / len(stocks) * 100, 2)) + '%' + '\n' + 'Return Timing: ' + str(
+    round(sum(forecast_stocks) / len(forecast_stocks) * 100, 2)) + '%'
+
+
+ax1 = forecast_probs_df['cumulative_returns'].plot(figsize=(8, 5), x='DATE', color='navy',
+                                                   label="Combined Timing")
+plt.plot(strategy_return_df['cumulative_returns'], color='mediumseagreen', label="Macro Timing")
+plt.plot(forecast_strategy_df['cumulative_returns'], color='deepskyblue', label="Return Timing")
+plt.plot(np.cumsum(excess_return_df_adj['excess_market_return']), color='darkorange', label="Buy-and-hold")
+(rec_data * 4).plot.area(ax=ax1, figsize=(8, 5), x='DATE', alpha=0.2, color="grey", label='_nolegend_')
+plt.xlim(start_date_strategy, end_date + pd.DateOffset(months=1))
+plt.ylim(0, 3.7)
+# plt.title("Cumulative excess returns")
+plt.legend(frameon=False, loc='lower center', ncol=4)
+plt.text(start_date_strategy + pd.DateOffset(months=12), 3, StockText, fontsize=8,
+         bbox=dict(facecolor='white', alpha=0.6))
+plt.text(pd.to_datetime("2014-01-01", format='%Y-%m-%d'), 1, SharpeText, fontsize=8,
+         bbox=dict(facecolor='white', alpha=0.6))
+ax1.xaxis.set_major_locator(mdates.YearLocator(base=2))
+ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+plt.gcf().autofmt_xdate()
+plt.show()
+
+
+##########################
+##    Draw-down Plot    ##
+##########################
+
+# Market and return timing
+forecast_probs_df['HighValue'] = forecast_probs_df['cumulative_returns'].cummax()
+forecast_probs_df['Drawdown'] = forecast_probs_df['cumulative_returns'] - forecast_probs_df['HighValue']
+# Market timing
+strategy_return_df['HighValue'] = strategy_return_df['cumulative_returns'].cummax()
+strategy_return_df['Drawdown'] = strategy_return_df['cumulative_returns'] - strategy_return_df['HighValue']
+# Return Timing
+forecast_strategy_df['HighValue'] = forecast_strategy_df['cumulative_returns'].cummax()
+forecast_strategy_df['Drawdown'] = forecast_strategy_df['cumulative_returns'] - forecast_strategy_df['HighValue']
+# Buy-and-hold
+excess_return_df_adj['cumulative_returns'] = np.cumsum(excess_return_df_adj['excess_market_return'])
+excess_return_df_adj['HighValue'] = excess_return_df_adj['cumulative_returns'].cummax()
+excess_return_df_adj['Drawdown'] = excess_return_df_adj['cumulative_returns'] - excess_return_df_adj['HighValue']
+
+ax2 = excess_return_df_adj['Drawdown'].plot(figsize=(8, 5), x='DATE', color='darkorange', alpha=0.8,
+                                            label="Buy-and-hold")
+plt.plot(forecast_probs_df['Drawdown'], color='navy', alpha=0.8, label="Combined Timing")
+# plt.plot(strategy_return_df['Drawdown'], color='cadetblue', label="Macro Timing")
+# plt.plot(forecast_strategy_df['Drawdown'] , color='dodgerblue', alpha=0.6, label="Return Timing")
+(rec_data * (-1)).plot.area(ax=ax2, figsize=(8, 5), x='DATE', alpha=0.2, color="grey", label='_nolegend_')
+plt.xlim(start_date_strategy, end_date + pd.DateOffset(months=1))
+plt.ylim(-0.75, 0.05)
+# plt.title("Draw-downs")
+plt.legend(frameon=False, loc='lower center', ncol=4)
+ax2.xaxis.set_major_locator(mdates.YearLocator(base=2))
+ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+plt.gcf().autofmt_xdate()
+plt.show()
+
+###########################
+##  Active returns plot  ##
+###########################
+
+active_return_mr = forecast_probs_df['forecast_probs_return'] - excess_return_df_adj['excess_market_return']
+active_return_r = forecast_strategy_df['forecast_strategy_return'] - excess_return_df_adj['excess_market_return']
+active_return_m = strategy_return_df['strategy_return'] - excess_return_df_adj['excess_market_return']
+
+ax2 = active_return_mr.plot(figsize=(8, 5), x='DATE', color='navy', alpha=0.8, label="Combined Timing")
+# plt.plot(active_return_m, color='cadetblue', label="Macro Timing")
+# plt.plot(active_return_r, color='dodgerblue', alpha=0.6, label="Return Timing")
+rec_data.plot.area(ax=ax2, figsize=(8, 5), x='DATE', alpha=0.2, color="grey", label='_nolegend_')
+(rec_data * (-1)).plot.area(ax=ax2, figsize=(8, 5), x='DATE', alpha=0.2, color="grey", label='_nolegend_')
+plt.xlim(start_date_strategy, end_date + pd.DateOffset(months=1))
+plt.ylim(-0.12, 0.25)
+# plt.title("Active returns")
+plt.legend(frameon=False, loc='lower center', ncol=4)
+ax2.xaxis.set_major_locator(mdates.YearLocator(base=2))
+ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+plt.gcf().autofmt_xdate()
+plt.show()
+
+################################
+##   CAPM alpha (as of MM17)  ##
+################################
+
+def CAPM_alpha(managed_return):
+    mm_df = pd.DataFrame({'r_man': managed_return, 'r_e': excess_market_return_adj * 12})
+    fit_mm = sm.ols('r_man ~ r_e ', data=mm_df).fit()
+    alpha = fit_mm.params[0]
+
+    return alpha * 100 * 12, fit_mm.conf_int(alpha=0.05)[0][0]*1200, fit_mm.conf_int(alpha=0.05)[1][0]*1200, fit_mm.pvalues[0], fit_mm
+
+
+# print("Macro timing", CAPM_alpha(strategy_return_df['strategy_return'])[:-1])
+# print("Return timing", CAPM_alpha(forecast_strategy_df['forecast_strategy_return'])[:-1])
+# print("Combined timing", CAPM_alpha(forecast_probs_df['forecast_probs_return'])[:-1])
+
+list_of_ols_timing = [CAPM_alpha(strategy_return_df['strategy_return'])[-1], CAPM_alpha(forecast_strategy_df['forecast_strategy_return'])[-1], CAPM_alpha(forecast_probs_df['forecast_probs_return'])[-1]]
+stargazer_timing = Stargazer(list_of_ols_timing)
+# print(stargazer_timing.render_latex())
+
+#################################################
+#  Test common component moving average window  #
+#################################################
+# Moving Average window sizes: 6 months to 3 years
+# Change sample size for either in-sample or out-of-sample
+
+samplesize = len(excess_market_return)
+# = len(excess_market_return)-len(excess_market_return_adj) if no look ahead bias 
+
+zt_df_MA = zt_df.copy()
+returns = np.zeros((samplesize, len(range(6, 37))))  # 31 = 37-6, i.e. we test 31 different MA windows
+sharpe_ratios = {}
+d = 0
+
+for MA_window in range(6, 37):  # 6 months to 3 years
+    # compute Moving Average. Update MA column in dataframe.
+    zt_df_MA['MA'] = zt_df['common_growth'].rolling(window=MA_window).mean()
+    # Adjust dates to match excess_market_return. Create new dataframe with the updated dates.
+    zt_MA = zt_df_MA.loc[zt_df_MA.index <= index_erm[samplesize - 1]]  # so no look ahead bias
+
+    # initialize storage vectors
+    strategy_return = np.asarray(excess_market_return[0])
+    strategy_stocks = np.asarray([0])
+
+    for i in range(1, samplesize):
+        if zt_df['common_growth'][i - 1] < zt_MA['MA'][i - 1] and excess_return_df['diff'][i - 1] < 0:
+            strategy_return = np.append(strategy_return, Tbill[i])
+            strategy_stocks = np.append(strategy_stocks, 0)
+        else:
+            strategy_return = np.append(strategy_return, excess_market_return[i])
+            strategy_stocks = np.append(strategy_stocks, 1)
+
+    # Adjust for transaction cost:
+    strategy_changePF = np.insert(strategy_stocks[:-1] != strategy_stocks[1:], 0, False)
+    strategy_return = strategy_return - 0.002 * np.array(strategy_changePF)
+
+    # Save
+    returns[:, d] = strategy_return
+
+    # Calculate annualized Sharpe ratio
+    sharpe_ratios[MA_window] = (strategy_return.mean() * 12) / (strategy_return.std() * np.sqrt(12)) * 100
+
+    # Adjust index
+    d += 1
+
+# Make dataframe
+MA_months = [str(month) for month in range(6, 37)]
+returns_df = pd.DataFrame(data=returns, columns=MA_months, index=index_erm[:samplesize])
+
+"""print("{:<10} {:<10}".format("MA window", "Sharpe ratio"))
+for key in sorted(sharpe_ratios, key=lambda k: sharpe_ratios[k]):
+    print("{:<10} {:<10}".format(key, sharpe_ratios[key]))
+"""
+########################################
+#  Test for business cycle dependence  #
+########################################
+# do a test for which indicator best captures the auto correlation dependency in the business cycle.
+# which b_1 estimate comes closest to the real thing (NBER)
+
+# The NBER indicator
+rec_data_b = fred.get_series('USREC', observation_start=start_date, observation_end=end_date).astype(bool)
+rec_data_b.index = pd.to_datetime(rec_data_b.index)
+rec_data_b = rec_data_b.resample('M').last()  # move to last day so we can compare
+rec_data_b = rec_data_b.drop(dates_to_remove, errors='ignore')
+
+# The common component indicator
+CommonComponent_indicator = np.array(zt_df['diff'] < 0)
+# Recession probability indicator
+RecessionProbFlt_indicator = np.array(pi_df['RecessionProbFlt'] > 0.5)
+# Combined indicator
+Combined_indicator = np.logical_and(np.array(CommonComponent_indicator), np.array(RecessionProbFlt_indicator))
+# Common Component and Return momentum indicator
+MarketAndReturn_indicator = np.logical_and(np.array(zt_df['diff'] < 0), np.array(excess_return_df['diff'] < 0))
+
+# Fix the dates for regression df
+excess_return_df.index = pd.to_datetime(excess_return_df.index)
+y_previousperiod = excess_return_df['excess_market_return'][:-1]
+
+y_previousperiod.index = excess_return_df['excess_market_return'][:-1].index.shift(1, freq='M')
+
+# Make data frame for regression
+df = pd.DataFrame(index=excess_return_df.index[1:],
+                  data={'y': y_previousperiod, 'y1': excess_return_df['excess_market_return'][1:],
+                        'NBER': np.array(rec_data_b)[1:],
+                        'CommonComponent': CommonComponent_indicator[1:],
+                        'RecessionProbFlt': RecessionProbFlt_indicator[1:],
+                        'Combined_CC_prob': Combined_indicator[1:],
+                        'Combined_CC_return': MarketAndReturn_indicator[1:]})
+
+# Seriel correlation regression: y_t = a + (b_0 + b_1 * 1_{rec})*y_{t-1}
+fit_NBER_auto = sm.ols('y1 ~ NBER:y + y', data=df).fit()
+fit_zt_auto = sm.ols('y1 ~ CommonComponent:y + y', data=df).fit()
+fit_pi_auto = sm.ols('y1 ~ RecessionProbFlt:y + y', data=df).fit()
+fit_com1_auto = sm.ols('y1 ~ Combined_CC_prob:y + y', data=df).fit()
+fit_com2_auto = sm.ols('y1 ~ Combined_CC_return:y + y', data=df).fit()
+
+# Indicator Regression: y_t = a + b_1 * 1_{rec}
+fit_NBER = sm.ols('y1 ~ NBER', data=df).fit()
+fit_zt = sm.ols('y1 ~ CommonComponent', data=df).fit()
+fit_pi = sm.ols('y1 ~ RecessionProbFlt', data=df).fit()
+fit_com1 = sm.ols('y1 ~ Combined_CC_prob', data=df).fit()
+fit_com2 = sm.ols('y1 ~ Combined_CC_return', data=df).fit()
+
+# Collect results in one table
+from statsmodels.iolib.summary2 import summary_col
+
+print("Serial Correlation in Returns - Regression: y_t = a + (b_0 + b_1 * 1_{rec})*y_{t-1}")
+ols_output = summary_col([fit_NBER_auto, fit_zt_auto, fit_pi_auto, fit_com1_auto, fit_com2_auto])
+print(ols_output)
+print()
+print("Recession Indicator Betas - Regression: y_t = a + b_1 * 1_{rec}")
+ols_output2 = summary_col([fit_NBER, fit_zt, fit_pi, fit_com1, fit_com2])
+print(ols_output2)
+
+# As LaTeX table
+stargazer_serial = Stargazer([fit_NBER_auto, fit_zt_auto, fit_pi_auto, fit_com1_auto, fit_com2_auto])
+print(stargazer_serial.render_latex())
+print()
+stargazer_indicator = Stargazer([fit_NBER, fit_zt, fit_pi, fit_com1, fit_com2])
+print(stargazer_indicator.render_latex())
+print()
+
+########################
+##  Dynamic Strategy  ##
+########################
+erm_trace = pd.read_csv('erm_trace.csv')
+h = np.median(erm_trace['h'], axis=0)
+sigma2_1 = np.median(erm_trace['sigma2_1'], axis=0) * 12
+
+ax1 = (mut_df_adj['forecast_variance']).plot()
+(rec_data).plot.area(ax=ax1, figsize=(8, 5), x='DATE', alpha=0.4, color="grey", label='_nolegend_')
+plt.hlines(y=excess_market_return_adj.var() * 12, xmin=start_date_strategy, xmax=end_date + pd.DateOffset(months=1),
+           linestyles='--', colors='black')
+plt.xlim(start_date_strategy, end_date + pd.DateOffset(months=1))
+plt.ylim(0, 0.7)
+plt.title("Conditional vs unconditional variance")
+plt.show()
+
+# Out of sample: make increasing df
+startsampleperiod = len(excess_market_return) - len(excess_market_return_adj)
+riskaversion = excess_market_return_adj.mean() / (excess_market_return_adj.var())
+
+def conditional_mv_strategy(conditional_mu, log_returns=False):
+    conditional_mu = conditional_mu
+
+    pf_return = np.array([0])
+    pf_u_return = np.array([0])
+    pf_ls_return = np.array([0])
+    pf_risk_return = np.array([0])
+    w_conditional = np.array([0])
+    w_unconditional = np.array([0])
+
+    # assert len(conditional_mu) == len(excess_market_return), "Wrong conditional_mu length"
+
+    for i in range(startsampleperiod, len(excess_market_return)):
+        if len(conditional_mu) == len(excess_market_return):
+            mu_er = conditional_mu[i]
+        else:
+            mu_er = conditional_mu[i - startsampleperiod]
+
+        # Define increasing dataframe
+        reg_df = pd.DataFrame(index=index_erm[:i], data={'excess_market_return':  np.squeeze(excess_market_return[:i]),
+                                                         'forecast_expected_returns': mut_df[
+                                                                                          'forecast_expected_returns'][
+                                                                                      :i],
+                                                         'RecessionProbFlt': pi_df['RecessionProbFlt'][:i],
+                                                         'log_returns': np.squeeze(excess_return_df['logreturns'][:i])})
+
+        uncon_var = (reg_df['excess_market_return'].var() * 12)  # multiply w 12 to match the annualized conditional mu
+        w_cond = (1 / riskaversion) * mu_er / uncon_var
+        w_uncond = (1 / riskaversion) * reg_df['excess_market_return'].mean() / reg_df['excess_market_return'].var()
+        w_ls = w_cond - w_uncond
+        w_risk = w_cond * 0.1 / np.sqrt(w_cond * uncon_var * w_cond)
+
+        if log_returns:
+            uncon_var = (reg_df['log_returns'].var() * 12)
+            w_cond = (1 / riskaversion) * mu_er / uncon_var
+            w_uncond = (1 / riskaversion) * reg_df['log_returns'].mean() / reg_df['log_returns'].var()
+            w_ls = w_cond - w_uncond
+            w_risk = w_cond * 0.1 / np.sqrt(w_cond * uncon_var * w_cond)
+
+        pf_cond = w_cond * excess_market_return[i]  # + (1 - w_cond) * Tbill[i]
+        pf_uncond = w_uncond * excess_market_return[i]
+        pf_ls = w_ls * excess_market_return[i]  # + (1 - w_ls) * Tbill[i]
+        pf_risk = w_risk * excess_market_return[i]  # + (1 - w_risk) * Tbill[i]
+
+        pf_return = np.append(pf_return, pf_cond)
+        pf_u_return = np.append(pf_u_return, pf_uncond)
+        pf_ls_return = np.append(pf_ls_return, pf_ls)
+        pf_risk_return = np.append(pf_risk_return, pf_risk)
+
+        w_conditional = np.append(w_conditional, w_cond)
+        w_unconditional = np.append(w_unconditional, w_uncond)
+
+    return pf_return, pf_u_return, pf_ls_return, pf_risk_return, w_conditional, w_unconditional
+
+
+pf_return, pf_u_return, pf_ls_return, pf_risk_return, w_conditional, w_unconditional = conditional_mv_strategy(
+    mut_df['forecast_expected_returns'] / 100)
+
+pf_df = pd.DataFrame(data=pf_return[1:], index=mut_df.index[startsampleperiod:], columns=['return'])
+pf_df['weights_conditional'] = w_conditional[1:]
+pf_df['weights_unconditional'] = w_unconditional[1:]
+
+pf_df['cumulative_returns'] = np.cumsum(pf_df['return'])
+pf_df['cumulative_returns_uncond'] = np.cumsum(pf_u_return[1:])
+pf_df['cumulative_returns_ls'] = np.cumsum(pf_ls_return[1:] * (np.sqrt(pf_u_return[1:].var()) / np.sqrt(pf_ls_return[1:].var())))
+pf_df['cumulative_returns_risk'] = np.cumsum(pf_risk_return[1:])
+
+pf_df['SharpeRatio_cond'] = (pf_df['return'].mean() * 12) / (pf_df['return'].std() * np.sqrt(12))
+pf_df['SharpeRatio_uncond'] = (pf_u_return[1:].mean() * 12) / (pf_u_return[1:].std() * np.sqrt(12))
+pf_df['SharpeRatio_ls'] = (pf_ls_return[1:].mean() * 12) / (pf_ls_return[1:].std() * np.sqrt(12))
+pf_df['SharpeRatio_risk'] = (pf_risk_return[1:].mean() * 12) / (pf_risk_return[1:].std() * np.sqrt(12))
+
+# significant from zero
+
+market_Sharpe_sample = (excess_return_df['excess_market_return'][startsampleperiod:].mean() * 12) / (
+        excess_return_df['excess_market_return'][startsampleperiod:].std() * np.sqrt(12))
+
+SharpeTextDyn = 'Annualized Sharpe Ratios' + '\n\n' + 'Conditional: ' + str(
+    round(pf_df['SharpeRatio_cond'][0] * 100, 2)) + '%' + '\n' + 'Unconditional: ' + str(
+    round(pf_df['SharpeRatio_uncond'][0] * 100, 2)) + '%' + '\n' + 'Long-Short: ' + str(round(pf_df['SharpeRatio_ls'][0] * 100, 2)) + '%'
+# 'Buy-and-hold: ' + str(round(market_Sharpe_sample * 100, 2)) + '%' + '\n'
+
+# Plot of conditional portfolio weights
+ax1 = pf_df['weights_conditional'].plot(figsize=(8, 5), x='DATE', color='navy', label="State-Space")
+plt.plot(pf_df['weights_unconditional'], color='darkgreen', label="Unconditional")
+(rec_data * 2).plot.area(ax=ax1, figsize=(8, 5), x='DATE', alpha=0.4, color="grey", label='_nolegend_')
+(rec_data * -2).plot.area(ax=ax1, figsize=(8, 5), x='DATE', alpha=0.4, color="grey", label='_nolegend_')
+plt.hlines(y=1, xmin=start_date_strategy, xmax=end_date + pd.DateOffset(months=1), linestyles='--', colors='black')
+plt.xlim(start_date_strategy, end_date + pd.DateOffset(months=1))
+plt.ylim(-2, 2.5)
+# plt.title("Dynamic portfolio weights")
+plt.legend(frameon=True, loc='upper left', ncol=2)
+ax1.xaxis.set_major_locator(mdates.YearLocator(base=2))
+ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+plt.gcf().autofmt_xdate()
+plt.show()
+
+# Plot cumulative gains of dynamic strategies
+ax1 = pf_df['cumulative_returns'].plot(figsize=(8, 5), x='DATE', color='navy', label="Dynamic Strategy (Conditional)")
+plt.plot(pf_df['cumulative_returns_uncond'], color='darkgreen', label="Dynamic Strategy (Unonditional)")
+plt.plot(pf_df['cumulative_returns_ls'], color='red', label="Dynamic Strategy (Long-Short)")
+# plt.plot(np.cumsum(excess_return_df['excess_market_return'][startsampleperiod:]), color='darkorange', label="Buy-and-Hold")
+(rec_data * 4).plot.area(ax=ax1, figsize=(8, 5), x='DATE', alpha=0.4, color="grey", label='_nolegend_')
+plt.xlim(start_date_strategy, end_date + pd.DateOffset(months=1))
+plt.ylim(-0.5, 4)
+# plt.title("Cumulative excess returns")
+plt.legend(frameon=True, loc='upper left', ncol=1)
+plt.text(pd.to_datetime("2015-01-01", format='%Y-%m-%d'), 1, SharpeTextDyn, fontsize=7,
+         bbox=dict(facecolor='white', alpha=0.2))
+ax1.xaxis.set_major_locator(mdates.YearLocator(base=2))
+ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+plt.gcf().autofmt_xdate()
+plt.show()
+
+##########################
+##    Draw-down Plot    ##
+##########################
+
+pf_df['HighValue'] = pf_df['cumulative_returns'].cummax()
+pf_df['Drawdown'] = pf_df['cumulative_returns'] - pf_df['HighValue']
+
+pf_df['HighValue_uncond'] = pf_df['cumulative_returns_uncond'].cummax()
+pf_df['Drawdown_uncond'] = pf_df['cumulative_returns_uncond'] - pf_df['HighValue_uncond']
+
+ax2 = pf_df['Drawdown'].plot(figsize=(8, 5), x='DATE', color='navy', alpha=0.8, label="State-Space")
+plt.plot(pf_df['Drawdown_uncond'], color='darkgreen', linestyle="--", alpha=0.8, label="Unconditional")
+(rec_data * (-1)).plot.area(ax=ax2, figsize=(8, 5), x='DATE', alpha=0.2, color="grey", label='_nolegend_')
+plt.xlim(start_date_strategy, end_date + pd.DateOffset(months=1))
+plt.ylim(-0.65, 0)
+# plt.title("Draw-downs")
+plt.legend(frameon=True, loc='lower left', ncol=2)
+ax2.xaxis.set_major_locator(mdates.YearLocator(base=2))
+ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+plt.gcf().autofmt_xdate()
+plt.show()
+
+##############
+##    CER   ##
+##############
+realized_pf_return = pf_df['return'] + Tbill_adj
+mu_p = realized_pf_return.mean()
+sigma2_p = realized_pf_return.var()
+CER_con = 12 * (mu_p - (riskaversion / 2) * sigma2_p)
+
+realized_pf_return_u = pf_u_return[1:] + Tbill_adj
+mu_p_u = realized_pf_return_u.mean()
+sigma2_p_u = realized_pf_return_u.var()
+CER_uncon = 12 * (mu_p_u - (riskaversion / 2) * sigma2_p_u)
+print()
+print("CER")
+print(CER_con * 100, CER_uncon * 100, (CER_con - CER_uncon) * 100)
+print("SR")
+print(pf_df['SharpeRatio_cond'][0], pf_df['SharpeRatio_uncond'][0], (pf_df['SharpeRatio_cond'][0] / pf_df['SharpeRatio_uncond'][0]))
+print()
+
+###################################################
+# O-O-S regression to estimate the equity premium #
+###################################################
+alphas = [np.nan]
+betas = [np.nan]
+# NBER_beta = [np.nan], possibly include perfect foresight to compare
+conf_bands_l = []
+conf_bands_u = []
+list_of_ols_regbased = []
+p_vals = []
+
+for h in range(1, 13):
+    excess_return_df_shifted = excess_return_df_adj.shift(-h)
+    # logreturns = np.log(1+excess_return_df_shifted['excess_market_return'])
+    reg_df = pd.DataFrame(index=index_erm, data={
+        'excess_market_return': np.squeeze(excess_return_df_shifted['logreturns']).rolling(h).sum() * (
+                12 / h),
+        'RecessionProbFlt': pi_df_adj['RecessionProbFlt'] - pi_df_adj['RecessionProbFlt'].mean()})
+
+    fit_recprob = sm.ols('excess_market_return ~ RecessionProbFlt ', data=reg_df).fit()
+    coefficients = fit_recprob.params
+    alphas.append(coefficients[0])
+    betas.append(coefficients[1])
+    list_of_ols_regbased.append(fit_recprob)
+    p_vals.append(fit_recprob.pvalues[1])
+
+    conf_bands_l.append(fit_recprob.conf_int(alpha=0.05)[0][1])
+    conf_bands_u.append(fit_recprob.conf_int(alpha=0.05)[1][1])
+
+plt.plot(betas, color="navy")
+plt.fill_between(x=range(1, 13), y1=conf_bands_l, y2=conf_bands_u, color="navy", alpha=0.2)
+plt.hlines(y=0, xmin=0, xmax=13, linestyles='--', colors='black')
+plt.xlim(0, 13)
+plt.plot(7.5, 0, 'ro', ms=5)
+plt.xticks(np.arange(0, 13, 1))
+plt.ylabel("Beta regression coefficient")
+plt.xlabel("Lag (h)")
+plt.show()
+
+# Print LaTeX stargazer table
+stargazer_regbased = Stargazer(list_of_ols_regbased)
+print(stargazer_regbased.render_latex())
+print(summary_col(list_of_ols_regbased))
+
+
+########################################
+# Expected excess return by regression #
+########################################
+import matplotlib as mpl
+color = mpl.cm.tab20.colors  # [2:]  # colors for plotting such that the h's have the same colors in the different plots.
+
+
+expected_excess_return = np.zeros((len(pi_df_adj), len(range(1, 13))))  # to store results
+ax = (excess_return_df_adj['excess_market_return'] * 0).plot(label='_nolengend_', color="black", alpha=0.01)  # so we can add recession bands
+plt.plot(np.log(1+mut_df['forecast_expected_returns'] / 100), color="black", alpha=0.3, linestyle='-.', label="State Space")
+
+for h in [1, 6, 12]:  # range(1, 13):
+    alpha = alphas[h]
+    beta = betas[h]
+
+    expected_excess_return_h = alpha + beta * (pi_df_adj['RecessionProbFlt'] - pi_df_adj['RecessionProbFlt'].mean())
+    expected_excess_return[:, (h - 1)] = alpha + beta * (
+            pi_df_adj['RecessionProbFlt'] - pi_df_adj['RecessionProbFlt'].mean())
+
+    plt.plot(expected_excess_return_h, label=h, alpha=1, color=color[h - 1])
+
+plt.hlines(y=alphas[6], xmin=start_date_strategy, xmax=end_date, label='Unconditional', colors='darkgreen', linestyles='--')
+(rec_data * 0.1).plot.area(ax=ax, figsize=(8, 5), x='DATE', alpha=0.2, color="gray", label='_nolengend_')
+plt.xlim(start_date_strategy - pd.DateOffset(months=1), end_date + pd.DateOffset(months=1))
+plt.ylim(0, 0.12)
+plt.legend()
+ax.xaxis.set_major_locator(mdates.YearLocator(base=2))
+ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+plt.gcf().autofmt_xdate()
+# plt.show()
+
+print(np.log(1+excess_market_return_adj.mean()*12), excess_market_return_adj.mean()*12)
+####### Mean-Variance strategy
+pf_h_return = {}  # np.zeros((len(pi_df_adj), len(range(1, 7))))
+pf_h_cumu = {}
+pf_h_cumu_ls = {}
+pf_h_weights = {}
+SR = [np.nan]
+SR_LS = [np.nan]
+CER = [np.nan]
+
+Ttest_LS = [np.nan]
+
+SharpeTextH_LS = 'Annualized Sharpe Ratios (L-S)' + '\n\n' + 'State-space: ' + str(
+    round(pf_df['SharpeRatio_ls'][0] * 100, 2)) + '%' + '\n'
+
+SharpeTextH = 'Annualized Sharpe Ratios' + '\n\n' + 'State-space: ' + str(
+    round(pf_df['SharpeRatio_cond'][0] * 100, 2)) + '%' + '\n'
+
+for h in [1]:  # range(1, 13):
+    pf_return_h, pf_u_return, pf_ls_return_h, pf_risk_return, w_conditional, w_unconditional = conditional_mv_strategy(
+        expected_excess_return[:, (h - 1)], log_returns=True)
+
+    uncon_stdd = np.sqrt(pf_u_return[1:].var())
+    con_stdd = np.sqrt(pf_ls_return_h[1:].var())
+
+    pf_h_return[h] = (pf_return_h[1:], pf_u_return[1:], pf_ls_return_h[1:], pf_risk_return[1:])
+    pf_h_cumu[h] = np.cumsum(pf_return_h[1:])
+    pf_h_cumu_ls[h] = np.cumsum(pf_ls_return_h[1:] * (uncon_stdd / con_stdd))  # multiply w (uncon_stdd / con_stdd) to get the same variance as the other strategies
+    pf_h_weights[h] = (w_conditional[1:], w_unconditional[1:])
+
+    # Sharpe Ratio
+    SR_h = (pf_return_h[1:].mean() * 12) / (pf_return_h[1:].std() * np.sqrt(12))
+    SR.append(SR_h)
+    SharpeTextH += "Regression: " + str(round(SR_h * 100, 2)) + "%" + '\n'  #  "Reg. w lag " + str(h) + ": " + str(round(SR_h * 100, 2)) + "%" + '\n'
+
+    SR_h_ls = (pf_ls_return_h[1:].mean() * 12) / (pf_ls_return_h[1:].std() * np.sqrt(12))
+    SR_LS.append(SR_h_ls)
+    Ttest_h_LS = stats.ttest_1samp(pf_ls_return_h[1:], popmean=0.00)
+    Ttest_LS.append(Ttest_h_LS)
+    SharpeTextH_LS += "Regression: " + str(round(SR_h_ls * 100, 2)) + "%"  # + '\n'  "Reg. w lag " + str(h) + ": " + str(round(SR_h_ls * 100, 2)) + "%" + '\n'
+
+    # CER
+    realized_pf_return = pf_return_h[1:] + Tbill_adj
+    mu_p = realized_pf_return.mean()
+    sigma2_p = realized_pf_return.var()
+    CER_h = 12 * (mu_p - (riskaversion / 2) * sigma2_p)
+    CER.append(CER_h)
+
+    print("h", h, "Sharpe", SR_h*100, "CER", CER_h * 100, "Delta CER", (CER_h - CER_uncon) * 100, "Sharpe (L-S)", SR_h_ls * 100, "mu_LS>0", Ttest_h_LS)
+
+print("Unconditional", "Sharpe", pf_df['SharpeRatio_uncond'][0], "CER", CER_uncon * 100)
+print("State-Space", "Sharpe", pf_df['SharpeRatio_cond'][0], "CER", CER_con * 100, "Delta CER", (CER_con - CER_uncon) * 100, "Sharpe (L-S)", pf_df['SharpeRatio_ls'][0], "mu_LS>0", stats.ttest_1samp(pf_ls_return[1:], popmean=0.00))
+
+# print("State-Space, cumu:", pf_df['cumulative_returns'][-1], "Uncon, cumu:",
+#      np.cumsum(excess_return_df_adj['excess_market_return'])[-1])
+SharpeTextH += 'Unconditional: ' + str(round(pf_df['SharpeRatio_uncond'][0] * 100, 2)) + '%'
+
+SharpeText_collected = SharpeTextH + '\n\n' + SharpeTextH_LS
+
+pf_h_ls_df = pd.DataFrame(index=excess_return_df_adj.index, data=pf_h_cumu_ls)
+pf_h_df = pd.DataFrame(index=excess_return_df_adj.index, data=pf_h_cumu)
+pf_u_return_df = pd.DataFrame(index=excess_return_df_adj.index, data={'pf_u_return': pf_u_return[1:]})
+
+ax = (np.cumsum(pf_u_return_df['pf_u_return'])).plot(label='Unconditional', color='darkgreen', linestyle='--')
+(rec_data * 3).plot.area(ax=ax, figsize=(8, 5), x='DATE', alpha=0.2, color="gray", label='_nolengend_')
+for h in [1]:  # [1, 6, 12]:  # range(1, 13):
+    plt.plot(pf_h_df[h], color="deepskyblue", label="Regression")   # color[h - 1]
+    plt.plot(pf_h_ls_df[h], color="deepskyblue", label='_nolengend_', alpha=0.5)  # color[h - 1]
+plt.plot(pf_df['cumulative_returns'], color="navy", label="State-space")
+plt.plot(pf_df['cumulative_returns_ls'], color="navy", label='_nolengend_', alpha=0.5)
+plt.text(pd.to_datetime("2015-01-01", format='%Y-%m-%d'), 0.1, SharpeText_collected, fontsize=7,
+         bbox=dict(facecolor='white', alpha=0.2))
+# plt.text(pd.to_datetime("2015-01-01", format='%Y-%m-%d'), 0.1, SharpeTextH_LS, fontsize=7,
+#         bbox=dict(facecolor='white', alpha=0.2))
+plt.xlim(start_date_strategy - pd.DateOffset(months=1), end_date + pd.DateOffset(months=1))
+plt.legend()
+plt.ylim(-0.15, 3.5)
+ax.xaxis.set_major_locator(mdates.YearLocator(base=2))
+ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+plt.gcf().autofmt_xdate()
+plt.show()
+
+# fig.savefig(path + f"image{h}.png", format="png")
+
+##########################
+##    Draw-down Plot    ##
+##########################
+
+return_h1_df = pd.DataFrame(index=excess_return_df_adj.index, data={'return': pf_h_return[h][0]})
+
+# Regression-based forecast
+return_h1_df['cumulative_returns'] = np.cumsum(return_h1_df['return'])
+return_h1_df['HighValue'] = return_h1_df['cumulative_returns'].cummax()
+return_h1_df['Drawdown'] = return_h1_df['cumulative_returns'] - return_h1_df['HighValue']
+
+# Unconditional
+# pf_u_return_df = pd.DataFrame(index=excess_return_df_adj.index, data={'pf_u_return': pf_u_return[1:]})
+pf_u_return_df['cumulative_returns'] = np.cumsum(pf_u_return_df['pf_u_return'])
+pf_u_return_df['HighValue'] = pf_u_return_df['cumulative_returns'].cummax()
+pf_u_return_df['Drawdown'] = pf_u_return_df['cumulative_returns'] - pf_u_return_df['HighValue']
+
+ax2 = pf_u_return_df['Drawdown'].plot(figsize=(8, 5), x='DATE', color='darkgreen', linestyle="--", alpha=0.8, label="Unconditional")
+# plt.plot(pf_df['Drawdown'], color="navy", alpha=0.6, label="State-Space")
+plt.plot(return_h1_df['Drawdown'], alpha=0.8, color="deepskyblue", label="Regression-based")
+(rec_data * (-1)).plot.area(ax=ax2, figsize=(8, 5), x='DATE', alpha=0.2, color="grey", label='_nolegend_')
+plt.xlim(start_date_strategy, end_date + pd.DateOffset(months=1))
+plt.ylim(-0.65, 0)
+# plt.title("Draw-downs")
+plt.legend(frameon=True, loc='lower left', ncol=2)
+ax2.xaxis.set_major_locator(mdates.YearLocator(base=2))
+ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+plt.gcf().autofmt_xdate()
+plt.show()
+
+###########################
+##  Active returns plot  ##
+###########################
+
+active_return_reg = return_h1_df['return'] - pf_u_return_df['pf_u_return']
+active_return_ss = pf_df['return'] - pf_u_return_df['pf_u_return']
+
+ax2 = active_return_ss.plot(figsize=(8, 5), x='DATE', color="navy", alpha=0.6, label="State-Space")
+plt.plot(active_return_reg,  color="deepskyblue", alpha=0.6, label="Regression")
+rec_data.plot.area(ax=ax2, figsize=(8, 5), x='DATE', alpha=0.2, color="grey", label='_nolegend_')
+(rec_data * (-1)).plot.area(ax=ax2, figsize=(8, 5), x='DATE', alpha=0.2, color="grey", label='_nolegend_')
+plt.xlim(start_date_strategy, end_date + pd.DateOffset(months=1))
+plt.ylim(-0.2, 0.25)
+# plt.title("Active returns")
+plt.legend(frameon=True, loc='upper left', ncol=4)
+ax2.xaxis.set_major_locator(mdates.YearLocator(base=2))
+ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+plt.gcf().autofmt_xdate()
+plt.show()
+
+##############################
+##  Portfolio weights plot  ##
+##############################
+
+weights_df = pd.DataFrame(index=excess_return_df_adj.index, data={'regression_weights': pf_h_weights[1][0]})
+
+ax1 = pf_df['weights_conditional'].plot(figsize=(8, 5), x='DATE', color='navy', alpha=0.6, label="State-Space")
+plt.plot(weights_df['regression_weights'], color="deepskyblue", label="Regression")
+plt.plot(pf_df['weights_unconditional'], color='darkgreen', linestyle="--", label="Unconditional")
+(rec_data * 2).plot.area(ax=ax1, figsize=(8, 5), x='DATE', alpha=0.2, color="grey", label='_nolegend_')
+(rec_data * -2).plot.area(ax=ax1, figsize=(8, 5), x='DATE', alpha=0.2, color="grey", label='_nolegend_')
+# plt.hlines(y=1, xmin=start_date_strategy, xmax=end_date + pd.DateOffset(months=1), colors='black')
+plt.xlim(start_date_strategy, end_date + pd.DateOffset(months=1))
+plt.ylim(-2, 1.8)
+# plt.title("Dynamic portfolio weights")
+plt.legend(frameon=True, loc='lower left', ncol=3)
+ax1.xaxis.set_major_locator(mdates.YearLocator(base=2))
+ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+plt.gcf().autofmt_xdate()
+plt.show()
+
+########################################
+#  OLS to test significance  - as MM17 #
+########################################
+
+
+def MM_alpha(managed_return):
+    mm_df = pd.DataFrame({'r_man': managed_return, 'r_e': excess_market_return_adj * 12})
+    fit_mm = sm.ols('r_man ~ r_e ', data=mm_df).fit()
+    alpha = fit_mm.params[0]
+    rmse = np.sqrt(fit_mm.mse_resid)
+
+    return alpha, alpha * 100 * 12, rmse, np.sqrt(12) * alpha/rmse, fit_mm
+
+
+print()
+print("State-Space: ", MM_alpha(pf_df['return'])[:-1], MM_alpha(pf_df['return'])[-1].conf_int(alpha=0.05)[0][0]*1200, MM_alpha(pf_df['return'])[-1].conf_int(alpha=0.05)[1][0]*1200, MM_alpha(pf_df['return'])[-1].pvalues[0])
+
+list_of_ols = [MM_alpha(pf_df['return'])[-1]]
+
+for h in [1]:  
+    r_man = pf_h_return[h][0]
+    fit = MM_alpha(r_man)[-1]
+    print(h, MM_alpha(r_man)[:-1], fit.conf_int(alpha=0.05)[0][0]*1200, fit.conf_int(alpha=0.05)[1][0]*1200, fit.pvalues[0])
+    list_of_ols.append(fit)
+
+print()
+ols_output = summary_col(list_of_ols)
+print(ols_output)
+stargazer_MM17 = Stargazer(list_of_ols)
+print(stargazer_MM17.render_latex())
+print()
+
+############################
+##    Regression w Bonds  ##
+############################
+
+data_l = pd.read_csv('clara_strategi_data.csv')
+data_l.index = [pd.to_datetime(date, format='%Y-%m-%d').date() for date in data_l['Unnamed: 0']]  # 1973-02-28 to 2019-12-31
+data_l = data_l.drop('Unnamed: 0', axis=1)
+
+start_date_bond = data_l.index[0]
+end_date_bond = data_l.index[-1]
+
+french_df_bond = french_df_erm.loc[(french_df_erm.index >= start_date_bond) & (french_df_erm.index <= end_date_bond)]
+
+# NBER indicator
+from fredapi import Fred
+fred = Fred(api_key='a3407b8c0abbc6892335e2b2a4612255')
+rec_data = fred.get_series('USREC', observation_start=start_date_bond, observation_end=end_date_bond)
+rec_data = rec_data.resample('M').last()
+
+# Make data frame for regression
+df = pd.DataFrame(index=data_l.index,
+                  data={'Bond': data_l['Bond'],
+                        'Tbill': french_df_bond['RF'] / 100,
+                        'Excess_return': french_df_bond['Mkt-RF'] / 100,
+                        'NBER': np.array(rec_data)}
+                  )
+
+fit_bond   = sm.ols('Bond ~ NBER', data=df).fit()
+fit_tbill  = sm.ols('Tbill ~ NBER', data=df).fit()
+fit_return = sm.ols('Excess_return ~ NBER', data=df).fit()
+
+print("Excess_return", fit_return.params[1], fit_return.conf_int(alpha=0.05)[0][1], fit_return.conf_int(alpha=0.05)[1][1], fit_return.pvalues[1])
+print("Tbill", fit_tbill.params[1], fit_tbill.conf_int(alpha=0.05)[0][1], fit_tbill.conf_int(alpha=0.05)[1][1], fit_tbill.pvalues[1])
+print("Bond", fit_bond.params[1], fit_bond.conf_int(alpha=0.05)[0][1], fit_bond.conf_int(alpha=0.05)[1][1], fit_bond.pvalues[1])
+
+ols_output = summary_col([fit_bond, fit_tbill, fit_return])
+print(ols_output)
+print()
+
+stargazer_bond = Stargazer([fit_bond, fit_tbill, fit_return])
+print(stargazer_bond.render_latex())
+
+
+
