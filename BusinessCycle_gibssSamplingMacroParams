@@ -1,0 +1,165 @@
+import numpy as np
+from scipy import linalg
+
+def generate_PSIandSIG_macro(y, x_t, gamma_i, SIG2_i, R0_V, T0_V, V0_, D0_, selectVar, nVars):
+    """Helper function for gibbsSamplingMacro(). See Kim (1999) section 8.3.3"""
+
+    if selectVar != (nVars-1):
+        Ystar = np.asmatrix(y - gamma_i * x_t).T
+        Xstar = Ystar[0:-1]
+        Ystar = Ystar[1:]
+        Tstar = len(Ystar)
+
+    else:  # selectVar == (nVars-1):
+        Ystar = np.asmatrix(y[3:] - gamma_i[0] * x_t[3:] - gamma_i[1] * x_t[2:-1] - gamma_i[2] * x_t[1:-2] - gamma_i[3] * x_t[0:-3]).T
+        Xstar = Ystar[3:-1]
+        Ystar = Ystar[4:]
+        Tstar = len(Ystar)
+
+    V = linalg.solve(R0_V + SIG2_i ** (-1) * Xstar.T @ Xstar, np.eye(1))[0, 0]
+    PSI = V * (R0_V @ T0_V + SIG2_i ** (-1) * Xstar.T @ Ystar)
+    C = linalg.cholesky(V, lower=False)
+    psi_macro = (PSI + C * np.random.standard_normal((1, 1)))[0, 0]
+
+    e_mat = Ystar - psi_macro * Xstar
+    nn = Tstar + V0_  # constant = 838
+    d = D0_ + e_mat.T @ e_mat
+
+    temp = linalg.cholesky(linalg.solve(d, np.eye(1)), lower=True) @ np.random.standard_normal((1, nn))
+    SIG2_i = linalg.solve(temp @ temp.T, np.eye(1))[0, 0]
+
+    return psi_macro,  SIG2_i
+
+def generate_gamma_macro(y, x_t, PSI_i, SIG2_i, R00_, T00_, R00_4, T00_4, selectVar, nVars):
+    """Helper function for gibbsSamplingMacro(). See Kim (1999) section 8.3.3"""
+
+    psi_1 = PSI_i[0]
+
+    if selectVar != (nVars-1):
+        Ystar = np.asmatrix(y[1:] - psi_1 * y[0:-1]).T
+        Xstar = np.asmatrix(x_t[1:] - psi_1 * x_t[0:-1]).T
+        Tstar, nVars = Xstar.shape[0], Xstar.shape[1]
+
+        # priors
+        R0 = R00_
+        T0 = T00_
+
+        V = linalg.solve(R0 + SIG2_i[0] ** (-1) * (Xstar.T @ Xstar), np.eye(nVars))[0, 0]
+        gamma = V * (R0 * T0 + SIG2_i[0] ** (-1) * (Xstar.T @ Ystar))[0, 0]
+        C = linalg.cholesky(V, lower=False)
+        gamma_macro = gamma + C.T @ np.random.standard_normal((nVars, 1))[0]
+
+    else:  # if selectVar == nVars-1:
+        Ystar = np.asmatrix(y[7:] - psi_1 * y[6:-1]).T
+        x_t = np.asmatrix(x_t).T
+
+        XSTAR_1 = x_t[7:, 0] - psi_1 * x_t[6:-1, 0]
+        XSTAR_2 = x_t[6:-1, 0] - psi_1 * x_t[5:-2, 0]
+        XSTAR_3 = x_t[5:-2, 0] - psi_1 * x_t[4:-3, 0]
+        XSTAR_4 = x_t[4:-3, 0] - psi_1 * x_t[3:-4, 0]
+        Xstar = np.concatenate((XSTAR_1, XSTAR_2, XSTAR_3, XSTAR_4), axis=1)
+        Tstar, nVars = Xstar.shape[0], Xstar.shape[1]
+        R0 = R00_4
+        T0 = T00_4
+
+        V = linalg.solve(R0 + SIG2_i[0] ** (-1) * (Xstar.T @ Xstar), np.eye(nVars))
+        gamma = V @ (R0 @ T0 + SIG2_i[0] ** (-1) * (Xstar.T @ Ystar))  # (4,1)
+        C = linalg.cholesky(V, lower=False)
+        gamma_macro = gamma + C.T @ np.random.standard_normal((nVars, 1))
+
+    return gamma_macro
+
+
+def gibbsSamplingMacro(yy, x_t, param_macro_gibbs: dict, priorsMacroGibbs: dict, indexMonthly):
+
+    nVars = yy.shape[1]
+
+    gamma_macro = param_macro_gibbs['gamma_macro']
+    SIG2_i_macro = param_macro_gibbs['SIG2_i_macro']
+    psi_macro = param_macro_gibbs['psi_macro']
+
+    R0_V = priorsMacroGibbs['R0_V']
+    T0_V = priorsMacroGibbs['T0_V']
+    V0_ = priorsMacroGibbs['V0_']
+    D0_ = priorsMacroGibbs['D0_']
+    R00_ = priorsMacroGibbs['R00_']
+    T00_ = priorsMacroGibbs['T00_']
+    R00_4 = priorsMacroGibbs['R00_4']
+    T00_4 = priorsMacroGibbs['T00_4']
+
+    if indexMonthly == 1:
+
+        for selectVar in range(0, nVars):   # 0, 1, ..., 11 = (nVars-1)
+            yy_select = yy[:, selectVar]
+
+            indexData = ~np.isnan(yy_select)
+            yy_select = yy_select[indexData]
+            x_t_select = x_t[indexData]
+
+            SIG2_i = SIG2_i_macro[selectVar]
+
+            if selectVar == (nVars-1):
+                gamma_i = gamma_macro[(nVars-1):]
+
+            else:
+                gamma_i = gamma_macro[selectVar]
+
+            # Generate PHIandSIG
+            psi_macro_temp, SIG2_i_temp = generate_PSIandSIG_macro(yy_select, x_t_select, gamma_i, SIG2_i, R0_V, T0_V, V0_, D0_, selectVar, nVars)
+
+            SIG2_i_macro[selectVar] = SIG2_i_temp
+            psi_macro[selectVar] = psi_macro_temp
+
+        gamma_macro_0 = np.array([])
+        for selectVar in range(0, nVars):
+            yy_select = yy[:, selectVar]
+
+            indexData = ~np.isnan(yy_select)
+            yy_select = yy_select[indexData]
+            x_t_select = x_t[indexData]
+
+            SIG2_i = SIG2_i_macro[selectVar]
+            PSI_i = psi_macro[selectVar]
+
+            gamma_macro_temp = generate_gamma_macro(yy_select, x_t_select, PSI_i, SIG2_i, R00_, T00_, R00_4, T00_4,
+                                                    selectVar, nVars)
+
+            gamma_macro_0 = np.vstack([gamma_macro_0, gamma_macro_temp]) if gamma_macro_0.size else gamma_macro_temp
+            
+            # fix idea comes from here: https://stackoverflow.com/questions/22732589/concatenating-empty-array-in-numpy
+
+        gamma_macro = gamma_macro_0
+
+    else:  # i.e. indexMonthly != 1
+
+        for selectVar in range(0, nVars):
+
+            yy_select = yy[:, selectVar]
+            indexData = ~np.isnan(yy_select)
+            yy_select = yy_select[indexData]
+            x_t_select = x_t[indexData]
+
+            SIG2_i = SIG2_i_macro[selectVar]
+            gamma_i = gamma_macro[selectVar]
+
+            psi_macro_temp, SIG2_i_temp = generate_PSIandSIG_macro(yy_select, x_t_select, gamma_i, SIG2_i, R0_V, T0_V, V0_, D0_, 1, nVars)
+
+            SIG2_i_macro[selectVar] = SIG2_i_temp
+            psi_macro[selectVar] = psi_macro_temp
+
+        gamma_macro_0 = np.array([])
+        for selectVar in range(0, nVars):
+            yy_select = yy[:, selectVar]
+            indexData = ~np.isnan(yy_select)
+            yy_select = yy_select[indexData]
+            x_t_select = x_t[indexData]
+
+            SIG2_i = SIG2_i_macro[selectVar]
+            PSI_i = psi_macro[selectVar]
+
+            gamma_macro_temp = generate_gamma_macro(yy_select, x_t_select, PSI_i, SIG2_i, R00_, T00_, R00_4, T00_4, 1, nVars)
+
+            gamma_macro_0 = np.vstack([gamma_macro_0, gamma_macro_temp]) if gamma_macro_0.size else gamma_macro_temp
+
+    return gamma_macro, psi_macro, SIG2_i_macro
+
