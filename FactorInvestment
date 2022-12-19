@@ -1,0 +1,143 @@
+import numpy as np
+import pandas as pd
+import statsmodels.formula.api as sm
+from statsmodels.iolib.summary2 import summary_col
+import matplotlib.pyplot as plt
+
+from fredapi import Fred
+fred = Fred(api_key='input_personal_api_key')   
+nber_data = fred.get_series('USREC').astype(bool)
+
+# Data downloaded from https://jkpfactors.com/?country=usa&factor=all_factors
+
+Factor_themes_data = np.genfromtxt('[usa]_[all_themes]_[monthly]_[vw_cap].csv', delimiter=',', skip_header=1,
+                                   dtype=[('location', '|S3'), ('name', '|S19'), ('freq', '|S7'), ('weighting', '|S6'),
+                                          ('n_factors', '<i8'),
+                                          ('date', '|S10'), ('ret', '<f8')])
+
+unique_themes = np.unique(Factor_themes_data['name'])
+
+fig, ax = plt.subplots(figsize=(8, 6))
+for theme in unique_themes:
+    df = Factor_themes_data[np.where(Factor_themes_data['name'] == theme)]
+    pd.DataFrame(df['ret']).plot(ax=ax, label=theme.decode("utf-8"))
+plt.legend()
+plt.show()
+
+themes_fit_summary = {}  # To store regression results
+
+for theme in unique_themes:  # running through factor themes
+    theme_data = Factor_themes_data[np.where(Factor_themes_data['name'] == theme)]
+
+    start_date = pd.to_datetime(theme_data['date'][0].decode("utf-8"), format='%Y-%m-%d')
+    end_date = pd.to_datetime(theme_data['date'][-1].decode("utf-8"), format='%Y-%m-%d')
+    rec_data_b = nber_data[(start_date <= nber_data.index) & (nber_data.index <= end_date)]
+
+    df = pd.DataFrame({'NBER': np.array(rec_data_b), 'y': theme_data['ret'][1:]})
+    fit_NBER = sm.ols('y ~ NBER', data=df).fit()   # y_t = b_0 + b_1 * 1_{rec}
+    themes_fit_summary[theme.decode("utf-8")] = fit_NBER
+
+
+# Print table with regression results 
+themes_summary_tab = [themes_fit_summary[i.decode("utf-8")] for i in unique_themes]
+# summary_col takes in a list of regression fit
+print(summary_col(themes_summary_tab))
+
+# To get it in LaTeX format
+from stargazer.stargazer import Stargazer
+stargazer = Stargazer(themes_summary_tab)
+print(stargazer.render_latex())
+
+####################
+# MM17: CAPM-alpha #
+####################
+
+# load recession probabilities
+macro_data = pd.read_csv('macro_5001_2210_fred_40000s.csv')
+macro_data.index = [pd.to_datetime(date, format='%Y-%m-%d').date() for date in macro_data['Unnamed: 0']]
+macro_data = macro_data.drop('Unnamed: 0', axis=1)
+
+start_date_strategy = pd.to_datetime('1985-01-01', format='%Y-%m-%d')
+end_date_strategy = pd.to_datetime('2021-12-31', format='%Y-%m-%d')  # pd.to_datetime('2019-12-31', format='%Y-%m-%d')
+date_range_strategy = pd.date_range(start=start_date_strategy, end=end_date_strategy, freq='M').strftime('%Y-%m-%d')
+index_strategy = [pd.to_datetime(date, format='%Y-%m-%d').date() for date in date_range_strategy if pd.to_datetime(date, format='%Y-%m-%d').date() in macro_data.index]
+
+pi_df = pd.DataFrame({'RecessionProbFlt': macro_data['Recession_prob_filtered_median']}, index=macro_data.index)
+pi_df_adj = pi_df.loc[(pi_df.index >= start_date_strategy) & (pi_df.index <= end_date_strategy)]
+
+# remove covid data from Factor data so it matches macro data index
+from datetime import datetime
+removedate1 =  datetime.strptime('2020-03-31', '%Y-%m-%d').date()  
+removedate2 =  datetime.strptime('2020-11-30', '%Y-%m-%d').date()  
+dates_to_remove = pd.date_range(start=removedate1, end=removedate2, freq='M')
+
+# Generate recession coefficients
+list_of_ols_betacoef = []
+list_of_ols = []
+alphas = []
+betas = []
+conf_bands_l = []
+conf_bands_u = []
+expected_excess_factor_return = np.zeros((len(pi_df_adj), len(unique_themes)))
+
+def MM_alpha(managed_factor, factor):
+    mm_df = pd.DataFrame({'r_man': managed_factor, 'r_e': factor})
+    fit_mm = sm.ols('r_man ~ r_e ', data=mm_df).fit()
+    alpha = fit_mm.params[0]
+    rmse = np.sqrt(fit_mm.mse_resid)
+
+    return alpha * 100 * 12, rmse, np.sqrt(12) * alpha/rmse,  fit_mm
+
+
+for i in range(len(unique_themes)):
+    theme = unique_themes[i]
+    theme_data = Factor_themes_data[np.where(Factor_themes_data['name'] == theme)]
+
+    index_strategy = [pd.to_datetime(date.decode("utf-8"), format='%Y-%m-%d').date() for date in theme_data['date']]
+    theme_df = pd.DataFrame(index=index_strategy, data={'factor': theme_data['ret']})
+    theme_df = theme_df.loc[(theme_df.index >= start_date_strategy) & (theme_df.index <= end_date_strategy)]
+    theme_df = theme_df.drop(dates_to_remove, errors='ignore')
+
+    reg_df = pd.DataFrame({'factor': theme_df['factor'].shift(1),
+                           'RecessionProbFlt': pi_df_adj['RecessionProbFlt'] - pi_df_adj['RecessionProbFlt'].mean()})
+
+    fit_recprob = sm.ols('factor ~ RecessionProbFlt ', data=reg_df).fit()
+    coefficients = fit_recprob.params
+    alphas.append(coefficients[0])
+    betas.append(coefficients[1])
+    list_of_ols_betacoef.append(fit_recprob)
+
+    conf_bands_l.append(fit_recprob.conf_int(alpha=0.05)[0][1])
+    conf_bands_u.append(fit_recprob.conf_int(alpha=0.05)[1][1])
+
+    #### Print result of Regression 1
+    print(theme.decode("utf-8"), coefficients[1], fit_recprob.conf_int(alpha=0.05)[0][1], fit_recprob.conf_int(alpha=0.05)[1][1], fit_recprob.pvalues[1])
+    print(fit_recprob.summary())
+
+    # Compute the expected excess return
+    expected_excess_factor_return[:, i] = coefficients[0] + coefficients[1] * (pi_df_adj['RecessionProbFlt'] - pi_df_adj['RecessionProbFlt'].mean())
+
+    # Do the strategy and compute numbers
+    managed_factor = expected_excess_factor_return[:, i]
+    factor = reg_df['factor']
+
+    #### Result of Regression 2
+    reg2_fit = MM_alpha(managed_factor, factor)[-1]
+
+    # Save regression result to print collected summary table
+    list_of_ols.append(reg2_fit)
+
+    print(theme.decode("utf-8"))
+    print(MM_alpha(managed_factor, factor)[-1].summary())
+    print(theme.decode("utf-8"), MM_alpha(managed_factor, factor)[0], reg2_fit.conf_int(alpha=0.05)[0][0]*1200, reg2_fit.conf_int(alpha=0.05)[1][0]*1200, reg2_fit.pvalues[0])
+
+
+print(unique_themes)
+ols_output = summary_col(list_of_ols)
+print(ols_output)
+
+stargazer_MM17 = Stargazer(list_of_ols)
+print(stargazer_MM17.render_latex())  # Regression 2
+stargazer_MM17_beta = Stargazer(list_of_ols_betacoef)
+print(stargazer_MM17_beta.render_latex())  # Regression 1
+
