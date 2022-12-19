@@ -1,0 +1,263 @@
+from datetime import time
+from datetime import datetime
+import matplotlib.dates as mdates
+import pandas as pd
+import matplotlib.pyplot as plt
+import scipy.io as sio
+import numpy as np
+import time
+from datetime import date
+
+def int2date(argdate: int):
+    argdate = int(str(argdate) + "01")
+    year = int(argdate / 10000)
+    month = int((argdate % 10000) / 100)
+    day = int(argdate % 100)
+    return date(year, month, day)
+
+
+##############
+##   DATA   ##
+##############
+
+# Get market excess return data
+french_df = pd.read_csv('F-F_Research_Data_Factors.csv')
+french_df.index = [pd.to_datetime(int2date(date), format='%Y-%m-%d').date() for date in french_df['Unnamed: 0']]
+french_df = french_df.drop('Unnamed: 0', axis=1)
+french_df.index = pd.to_datetime(french_df.index)
+french_df = french_df.resample('M').last()
+french_df.index = [pd.to_datetime(date, format='%Y-%m-%d').date() for date in french_df.index]
+
+## Load the recession probs, pi_t, and the common growth component, z_t
+macro_df = pd.read_csv('macro_5001_2210_fred_40000s.csv')
+macro_df.index = [pd.to_datetime(date, format='%Y-%m-%d').date() for date in macro_df['Unnamed: 0']]
+macro_df = macro_df.drop('Unnamed: 0', axis=1)
+
+startdate_macro = macro_df.index[0]
+if macro_df.index[-1] <= french_df.index[-1]:
+    enddate_macro = macro_df.index[-1]   # if we use data until 2019
+else:
+    enddate_macro = french_df.index[-1]  # if we use data until 2022
+
+### Define date index, remove covid dates to match the macro dataframe
+removedate1 =  datetime.strptime('2020-03-31', '%Y-%m-%d').date()  
+removedate2 =  datetime.strptime('2020-11-30', '%Y-%m-%d').date()  
+dates_to_remove = pd.date_range(start=removedate1, end=removedate2, freq='M')
+
+dates_erm = pd.date_range(start=startdate_macro, end=enddate_macro, freq='M').strftime('%Y-%m-%d')
+index_erm = [pd.to_datetime(date, format='%Y-%m-%d').date() for date in dates_erm if date not in dates_to_remove]
+
+# fix dates to match macro data frame - remove covid data
+french_df_erm = french_df.loc[(french_df.index >= index_erm[0]) & (french_df.index <= index_erm[-1])]
+french_df_erm = french_df_erm.drop(dates_to_remove, errors='ignore')
+
+# Fix dates to match return data. Covid data is already removed from the macro dataframe
+macro_df_erm = macro_df.loc[(macro_df.index >= index_erm[0]) & (macro_df.index <= index_erm[-1])]
+
+# Define quantities
+z_t = np.asmatrix(macro_df_erm['Common_growth_component_median'].to_numpy()).T
+pi_t = np.asmatrix(macro_df_erm['Recession_prob_filtered_mean'].to_numpy()).T
+pi_t[np.isnan(pi_t)] = 0
+
+## Get NBER recession data
+from fredapi import Fred
+fred = Fred(api_key='input_personal_api_key')
+rec_data = fred.get_series('USREC', observation_start=index_erm[0], observation_end=index_erm[-1])
+rec_data.index = [pd.to_datetime(date, format='%Y-%m-%d').date() for date in rec_data.index]
+rec_data.index = pd.to_datetime(rec_data.index)
+# This loads data in as the first in the month - the macro data is loaded as the last day of the month
+rec_data = rec_data.resample('M').last() # move to last day so we can compare
+rec_data = rec_data.drop(dates_to_remove, errors='ignore')
+NBERIndex = rec_data.to_numpy()
+
+nsim = 40000
+nburn = 0 * nsim
+cc0 = 0.0001
+cc = 0.0005
+counter = 0
+
+
+###################################
+##  Metropolis Hastings Sampler  ##
+###################################
+riskFreeRate = french_df_erm['RF'].to_numpy() / 100  
+YY = np.asmatrix(french_df_erm['Mkt-RF'].to_numpy() / 100).T  
+
+mean_excess_return = np.mean(YY)*1200
+print("unconditional in-sample mean_excess_return: ", mean_excess_return)
+
+T = len(YY)
+sigma2_1_fix = np.std(YY[~np.array(NBERIndex, dtype=bool)]) ** 2
+
+### Priors and parameter bounds
+exec(open("ERM_boundsParam.py").read())
+exec(open("ERM_priorParam.py").read())
+para = open("para.txt", "r").readlines()
+para = np.asmatrix([float(para[i].strip()) for i in range(0, len(para))]).T
+
+npara = len(para)
+para_old = para
+
+indexMinimize = 0
+
+fcn = lambda x1: objfcnMixStates(x1, YY, pi_t, indexMinimize, pshape, pmean, pstdd, pmask, pmaskinv, pfix, lubound)
+
+post_old, like_old, At_mat_tot_old, At_pred_tot_old, Pt_pred_tot_old, Kgain_old, loglh_tot_old, modelInfo_1_old, modelInfo_2_old = fcn(
+    para_old)
+
+check = 0
+counter = 0
+
+while check < 1:
+    counter += 1
+    print("while loop", counter)
+    para_old = np.random.default_rng().multivariate_normal(mean=np.asarray(para_old)[:, 0], cov=cc0 * sigscale,
+                                                           size=1).T
+    para_old = np.multiply(para_old, pmaskinv) + np.multiply(pfix, pmask)
+
+    post_old, like_old, At_mat_tot_old, At_pred_tot_old, Pt_pred_tot_old, Kgain_old, loglh_tot_old, modelInfo_1_old, modelInfo_2_old = fcn(
+        para_old)
+        
+    if post_old > -1e6:
+        check = 1
+
+### Random Walk Metropolis Algorithm
+lbd = lubound
+
+# vectors for storage
+parasim = np.zeros((nsim, npara))  # parameter draws
+likesim = np.zeros((nsim, 1))      # likelihood
+postsim = np.zeros((nsim, 1))      # posterior probability
+rej = np.zeros((nsim, 1))          # rej = 1: rejected
+X_sm_simul = np.zeros((nsim, T, 3))
+X_up_simul = np.zeros((nsim, T, 3))
+X_pred_simul = np.zeros((nsim, T, 3))
+P_pred_simul = np.zeros((nsim, T, 3 ** 2))
+kg_sim = np.zeros((nsim, 2))
+logLikiMix = np.zeros((T, nsim))
+logLikiMod_1 = np.zeros((T, nsim))
+logLikiMod_2 = np.zeros((T, nsim))
+X_up_mix = np.zeros((T, nsim))
+X_up_Mod_1 = np.zeros((T, nsim))
+X_up_Mod_2 = np.zeros((T, nsim))
+
+sims_erm = np.zeros((nsim, 1))
+
+for indexSimul in range(0, nsim):
+    t0 = time.time()
+    print("indexSimul", indexSimul)
+
+    # propose a candidate inside bounds
+    genacc = 0
+    while genacc < 1:
+        para_new = np.random.default_rng().multivariate_normal(mean=np.asarray(para_old)[:, 0], cov=cc * sigscale,
+                                                               size=1).T
+        para_new = np.multiply(para_new, pmaskinv) + np.multiply(pfix, pmask)
+        par1 = para_new
+
+        # check boundary conditions
+        if all(lbd[:, 1] > par1) and all(par1 > lbd[:, 0]):
+            genacc = 1
+        # if boundary conditions hold, genacc=1 and while loop will stop
+
+    # evaluate at the new candidate
+    post_new, like_new, At_mat_tot_new, At_pred_tot_new, Pt_pred_tot_new, Kgain_new, loglh_tot_new, modelInfo_1_new, modelInfo_2_new = fcn(
+        para_new)
+        
+    r = min([1, np.exp(post_new - post_old)])
+
+    # draw a random number from the uniform distribution to determine if we should reject sample or not
+    if np.random.rand(1) > r:  # reject the candidate
+        rej[indexSimul] = 1
+    else:  # accept the candidate
+        para_old = para_new
+        post_old = post_new
+        like_old = like_new
+        # At_draw_tot_old = At_draw_tot_new
+        At_mat_tot_old = At_mat_tot_new
+        At_pred_tot_old = At_pred_tot_new  # one of the values inside integral \hat{mu}_{t+1|t}
+        Pt_pred_tot_old = Pt_pred_tot_new
+        Kgain_old = Kgain_new
+        loglh_tot_old = loglh_tot_new
+        modelInfo_1_old = modelInfo_1_new
+        modelInfo_2_old = modelInfo_2_new
+
+    #### Store simulated values
+    parasim[indexSimul, :] = para_old.T
+    likesim[indexSimul] = like_old
+    postsim[indexSimul] = post_old
+
+    X_up_simul[indexSimul, :, :] = At_mat_tot_old
+    X_pred_simul[indexSimul, :, :] = At_pred_tot_old
+    P_pred_simul[indexSimul, :, :] = Pt_pred_tot_old
+
+    kg_sim[indexSimul, :] = Kgain_old
+
+    logLikiMix[:, indexSimul] = np.asarray(loglh_tot_old).flatten()
+    logLikiMod_1[:, indexSimul] = modelInfo_1_old[:, 0]
+    logLikiMod_2[:, indexSimul] = modelInfo_2_old[:, 0]
+
+    X_up_mix[:, indexSimul] = np.squeeze(At_mat_tot_old[:, 1])
+    X_up_Mod_1[:, indexSimul] = modelInfo_1_old[:, 2]
+    X_up_Mod_2[:, indexSimul] = modelInfo_2_old[:, 2]
+
+    t1 = time.time()
+    sims_erm[indexSimul] = t1 - t0
+
+
+
+print("M-H acceptance percentage: ", round((1 - np.mean(rej)) * 100, 2), "%")
+
+# Kalman gain
+"""print()
+print("Kalman Gain posterior distribution quantiles (recessionary regime)")
+print("5%", np.quantile(kg_sim[:, 1], .05))
+print("50%", np.quantile(kg_sim[:, 1], .50))
+print("95%", np.quantile(kg_sim[:, 1], .95))
+print()
+print("Kalman Gain posterior distribution quantiles (expansionary regime)")
+print("5%", np.quantile(kg_sim[:, 0], .05))
+print("50%", np.quantile(kg_sim[:, 0], .50))
+print("95%", np.quantile(kg_sim[:, 0], .95))
+print()"""
+
+######################################
+####      Define data frames       ###
+######################################
+# To be used for plotting and trading strategy
+
+### Define excess return dataframe
+# times 12: annualize
+# times 100: in percentage pr year
+forecast_expected_returns = np.median(np.squeeze(X_pred_simul[:, :, 0]), axis=0) * 12 * 100  # \hat{mu}_{t+1|t}
+filtered_expected_returns = np.median(np.squeeze(X_up_simul[:, :, 0]), axis=0) * 12 * 100    # \hat{mu}_{t+1|t+1}
+forecast_variance = np.median(np.squeeze(P_pred_simul[:, :, 0]), axis=0) * 12 * 100          # P_{t+1|t}
+mut_df = pd.DataFrame(data=forecast_expected_returns, index=index_erm, columns=['forecast_expected_returns'])
+mut_df['forecast_variance'] = forecast_variance
+mut_df['filtered_expected_returns'] = filtered_expected_returns
+mut_df['lower_q'] = np.quantile(np.squeeze(X_up_simul[:, :, 0]), axis=0, q=0.05) * 12 * 100
+mut_df['upper_q'] = np.quantile(np.squeeze(X_up_simul[:, :, 0]), axis=0, q=0.95) * 12 * 100
+# YY rn is a np.array. To calculate CMA we need it to be a pandas timeseries.
+mut_df['CMA'] = pd.Series(np.squeeze(np.asarray(YY)), index=index_erm).expanding().mean() * 1200
+
+pd.DataFrame(mut_df).to_csv(r'mut5022_fred25000s_2.csv', index=True, header=True)
+
+### Parameters data frame
+parameters_gibbs = np.median(parasim, axis=0)
+
+#########################################
+#  Data frames for posterior Inference  #
+#########################################
+import arviz as az
+
+erm_trace = {'mu_l': parasim[:, 0],
+             'rho_l': parasim[:, 1],
+             'corr_s': parasim[:, 2],
+             'phi_1': parasim[:, 3],
+             'phi_2': parasim[:, 4],
+             'h': parasim[:, 5],
+             'sigma2_1': parasim[:, 6],
+             'SimTime': np.squeeze(sims_erm)}
+
+pd.DataFrame(erm_trace).to_csv(r'erm_trace5022_fred25000s_2.csv', index=True, header=True)
+
