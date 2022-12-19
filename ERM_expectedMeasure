@@ -1,0 +1,165 @@
+import numpy as np
+from scipy import linalg
+from scipy.stats import beta, gamma, norm
+
+
+def evalmod(para, YY, indexMinimize):
+
+    YY = np.asmatrix(YY)
+
+    T, nv = YY.shape[0], YY.shape[1]
+    H0, H1, RR, F0, F1, Q = coefficients(para)
+    mdim = F1.shape[0]
+
+    At = np.asmatrix([para[0, 0], 0, 0]).T
+    Pt = linalg.solve_discrete_lyapunov(F1, Q)
+
+    At_pred = np.zeros((T, mdim))
+    At_mat = np.zeros((T, mdim))
+
+    Pt_pred = np.zeros((T, mdim ** 2))
+    Pt_mat = np.zeros((T, mdim ** 2))
+    Kg_mat = np.zeros((T, mdim))
+
+    loglh = np.empty((T, 1))
+    constloglh = 0.5 * nv * np.log(2 * np.pi)
+
+    for t in range(0, T):
+        At1 = At
+        Pt1 = Pt
+
+        alphahat = F0 + F1 @ At1
+        Phat = F1 @ Pt1 @ F1.T + Q
+        Phat = 0.5 * (Phat + Phat.T)
+
+        # new data point
+        yhat = H0 + H1 @ alphahat
+        nut = YY[t, :].T - yhat
+
+        Ft = H1 @ Phat @ H1.T + RR
+        Ft = 0.5 * (Ft + Ft.T)
+
+        invFt = linalg.solve(Ft, np.eye(nv))
+
+        # the log of a multivariate Gaussian density:
+        loglh[t] = np.real(-constloglh-0.5 * np.log(linalg.det(Ft)) - 0.5 * nut.T @ invFt @ nut)
+
+        Phat_h1 = Phat @ H1.T
+
+        Kgain = ((Phat @ H1.T) @ invFt)
+        Kg_mat[t, :] = Kgain.T
+
+        At = alphahat + Phat_h1 @ invFt @ nut
+        Pt = Phat - Phat_h1 @ invFt @ Phat_h1.T
+
+        At_mat[t, :] = At.T
+        Pt_mat[t, :] = Pt.reshape(1, mdim**2)
+        At_pred[t, :] = alphahat.T  # used as component in mu_{t+1|t}
+        Pt_pred[t, :] = Phat.reshape(1, mdim**2)
+
+    return loglh, At_mat, Kg_mat, At_pred, Pt_pred 
+    
+ 
+
+
+def evalmodMix(para, YY, pi_t, indexMinimize):
+
+    # Specify parameters
+    mu_l = para[0, 0]
+    rho_l = para[1, 0]
+    corr_s = para[2, 0]
+    phi_1 = para[3, 0]
+    phi_2 = para[4, 0]
+    h = para[5, 0]
+    sigma2_1 = para[6, 0]
+
+    # Parameters in state 1
+    para_1 = np.asmatrix([[mu_l], [rho_l], [corr_s], [phi_1], [sigma2_1]])
+
+    # Parameters in state 2
+    para_2 = np.asmatrix([mu_l, rho_l, corr_s, phi_2, sigma2_1*(1+h)]).T
+
+    loglh_1, At_mat_1, Kg_mat_1, At_pred_1, Pt_pred_1 = evalmod(para_1, YY, indexMinimize)  
+    loglh_2, At_mat_2, Kg_mat_2, At_pred_2, Pt_pred_2 = evalmod(para_2, YY, indexMinimize)  
+
+    loglh_tot = np.multiply((1 - pi_t), loglh_1) + np.multiply(pi_t, loglh_2)
+
+    At_mat_tot = np.multiply((1 - pi_t), At_mat_1) + np.multiply(pi_t, At_mat_2)
+    At_pred_tot = np.multiply((1 - pi_t), At_pred_1) + np.multiply(pi_t, At_pred_2)   # component inside integral \hat{mu}_{t+1|t}
+    Pt_pred_tot = np.multiply((1 - pi_t), Pt_pred_1) + np.multiply(pi_t, Pt_pred_2)
+
+    Kgain = np.hstack((Kg_mat_1[0, 0], Kg_mat_2[0, 0]))
+
+    modelInfo_1 = np.column_stack((loglh_1, At_mat_1[:, 1], At_pred_1[:, 1]))  
+    modelInfo_2 = np.column_stack((loglh_2, At_mat_2[:, 1], At_pred_2[:, 1]))  
+
+    return loglh_tot, At_mat_tot, At_pred_tot, Pt_pred_tot, Kgain, modelInfo_1, modelInfo_2 
+    
+
+
+
+
+def objfcnMixStates(para, YY, pi_t, indexMinimize, pshape, pmean, pstdd, pmask, pmaskinv, pfix, lubound):
+
+    parabd_ind1 = para > lubound[:, 0]
+    parabd_ind2 = para < lubound[:, 1]
+
+    parabd_ind1 = (parabd_ind1 + pmask).prod(0)
+    parabd_ind2 = (parabd_ind2 + pmask).prod(0)
+
+    if ((parabd_ind1 > 0) and (parabd_ind2 > 0)):
+        # Calculate likelihood
+        modelpara = np.multiply(para, pmaskinv) + np.multiply(pfix, pmask)
+
+        loglh_tot, At_mat_tot, At_pred_tot, Pt_pred_tot, Kgain, modelInfo_1, modelInfo_2 = evalmodMix(modelpara, YY, pi_t, indexMinimize)
+        lnpY = sum(loglh_tot)
+
+        # Evaluate prior
+        lnprior = 0
+        for i in range(0, len(para)):
+            if pmask[i] == 1:
+                lnprior = lnprior
+            else:
+                if pshape[i] == 1:  # Beta prior
+                    a = (1-pmean[i]) @ pmean[i]**2 / pstdd[i]**2 - pmean[i]
+                    b = a @ (1 / pmean[i] - 1)
+                    lnprior += np.log(beta.pdf(para[i], a, b))
+
+                elif pshape[i] == 2:  # Gamma prior
+                    b = pstdd[i] ** 2 / pmean[i]
+                    a = pmean[i] / b
+                    lnprior += np.log(gamma.pdf(para[i], a=a, scale=b))
+
+                elif pshape[i] == 3:  # Gaussian prior
+                    a = pmean[i]
+                    b = pstdd[i]
+                    lnprior += np.log(norm.pdf(para[i], loc=a, scale=b))
+
+                elif pshape[i] == 4:  # Inverse gamma prior
+                    aux = para[i] ** 2
+                    a = pmean[i]
+                    b = pstdd[i]
+                    lnprior += np.log(aux**(-b-1)*np.exp(-0.5*b*a**2/aux**2))
+                    
+                elif pshape[i] == 5:  # Uniform prior
+                    a = pmean[i]
+                    b = pstdd[i]
+                    lnprior += np.log((para[i] - a) / (b - a))
+
+        if indexMinimize == 1:  # Minimize the negative of the Posterior
+            retp1 = np.real(lnpY[0] - lnprior)
+            # lnpY[0] is already negative
+        else:
+            retp1 = np.real(lnpY[0] + lnprior)
+
+        retp2 = np.real(lnpY[0])
+
+    else:
+        retp1 = -1e20
+        retp2 = -1e20
+        At_draw = -1e20
+        At_mat = -1e20
+        sGG = -1e20
+        KG = [0, 0]
+
+    return retp1, retp2, At_mat_tot, At_pred_tot, Pt_pred_tot, Kgain, loglh_tot, modelInfo_1, modelInfo_2 
