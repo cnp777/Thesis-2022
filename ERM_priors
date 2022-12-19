@@ -1,0 +1,77 @@
+import numpy as np
+
+
+### LOWER AND UPPER BOUND FOR PARAMETER VALUES
+bmu = np.asmatrix([-1, 1])
+brho = np.asmatrix([-0.9999, 0.9999])
+bsigma = np.asmatrix([0.00003, 1])
+bcorr = np.asmatrix([-0.9999, 0.9999])
+rsquared = np.asmatrix([0, 0.16])
+hparam = np.asmatrix([0, 5])
+
+lubound = np.concatenate([bmu, brho, brho, rsquared, rsquared, hparam, bsigma], axis=0)
+
+### State-Space coefficients
+def coefficients(para):
+    mu_l = para[0, 0]
+    rho_l = para[1, 0]
+    corr_s = para[2, 0]
+    phi = para[3, 0]
+    sigma2 = para[4, 0]
+
+    sigma2_l = (1 - rho_l ** 2) * phi * sigma2
+    sigma2_r = (1 - phi) * sigma2
+
+    sigma2_lr = corr_s * sigma2_l**0.5 * sigma2_r**0.5  #corr_s * sigma2 * ((1 - rho_l ** 2) * phi * (1 - phi))**0.5
+
+    H0 = 0
+    H1 = np.asmatrix([0, 1, 1])  # 1x3
+    RR = 0
+
+    # State-Transition Matrices
+    F0 = np.asmatrix([mu_l * (1 - rho_l), 0, 0]).T  # 3x1
+    F1 = np.asmatrix([[rho_l, 0, 0],
+                     [1, 0, 0],
+                     [0, 0, 0]])
+    Q = np.asmatrix([[sigma2_l, 0, sigma2_lr],
+                    [0, 0, 0],
+                    [sigma2_lr, 0, sigma2_r]])
+
+    return H0, H1, RR, F0, F1, Q
+    
+
+### Prior parameters
+
+#   1: BETA(mean,stdd)
+#   2: GAMMA(mean,stdd)
+#   3: NORMAL(mean,stdd)
+#   4: INVGAMMA(s^2,nu)
+#   5: UNIFORM(a,b)
+#   0: no prior
+
+prior = np.matrix([[3,  np.mean(YY[:, 0]),          0.0001,        0,    np.mean(YY[:, 0])],
+                   [3,               0.97,           0.001,        0,           0.97],
+                   [3,             -0.985,            0.05,        0,           0.99],
+                   [5,                  0,             0.2,        0,           0.99],
+                   [5,                  0,             0.2,        0,           0.99],
+                   [5,                  0,               4,        0,           0.99],
+                   [5,                  0,               4,        1,          sigma2_1_fix]])
+
+
+pshape = prior[:, 0]
+pmean  = prior[:, 1]
+pstdd  = prior[:, 2]
+pmask  = prior[:, 3]
+pfix   = prior[:, 4]
+
+pmaskinv = 1 - pmask
+pshape   = np.multiply(pshape, pmaskinv)
+
+sigscale = np.asmatrix([[0.0006,         0,         0,         0,         0,         0,         0],
+                             [0,    0.0010,         0,         0,         0,         0,         0],
+                             [0,         0,    0.0010,         0,         0,         0,         0],
+                             [0,         0,         0,    0.0001,         0,         0,         0],
+                             [0,         0,         0,         0,    0.0001,         0,         0],
+                             [0,         0,         0,         0,         0,    0.1384,         0],
+                             [0,         0,         0,         0,         0,         0,    0.0002]])
+
