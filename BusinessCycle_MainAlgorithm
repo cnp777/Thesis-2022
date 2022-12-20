@@ -1,0 +1,285 @@
+import matplotlib.pyplot as plt
+import numpy as np
+import scipy.io as sio
+import pandas as pd
+import matplotlib.dates as mdates
+from datetime import datetime
+
+##################################
+####         Main Code        ####
+##################################
+
+### Data provided by the Journal of Finance
+# data = sio.loadmat('dataMacroFinance_1950_2019_updated.mat')
+# data is loaded as a dictionary
+# print(data.keys())
+# y_monthly_jof = np.array(data['y_monthly'])  # (840, 12)
+# NBER_rec_index = np.array(data['NBER_rec_index'])  # (840, 1)
+# y_quarterly_jof = np.array(data['y_quarterly'])  # (840, 3)
+# enddate_jof = pd.to_datetime('2019-12-31', format='%Y-%m-%d')
+
+### Load macro data from csv
+y_monthly_new = pd.read_csv('y_monthly_fred.csv')
+y_monthly_new.index = [pd.to_datetime(date, format='%Y-%m-%d').date() for date in y_monthly_new['Unnamed: 0']]
+y_monthly_new = y_monthly_new.drop('Unnamed: 0', axis=1)
+# y_monthly_new = y_monthly_new.loc[y_monthly_new.index <= enddate_jof]
+
+y_quarterly_new = pd.read_csv('y_quarterly_fred.csv')
+y_quarterly_new.index = [pd.to_datetime(date, format='%Y-%m-%d').date() for date in y_quarterly_new['Unnamed: 0']]
+y_quarterly_new = y_quarterly_new.drop('Unnamed: 0', axis=1)
+# y_quarterly_new = y_quarterly_new.loc[y_quarterly_new.index <= enddate_jof]
+
+### Account for Covid outliers
+removedate1 = datetime.strptime('2020-03-31', '%Y-%m-%d').date()
+removedate2 = datetime.strptime('2020-11-30', '%Y-%m-%d').date()
+dates_to_remove = pd.date_range(start=removedate1, end=removedate2, freq='M')
+y_monthly_new = y_monthly_new.drop(dates_to_remove, errors='ignore')
+y_quarterly_new = y_quarterly_new.drop(dates_to_remove, errors='ignore')
+
+## If we wish to remove the start dates so it matches with his Figure 1 (comment this out if we want the full sample)
+removedate11 = datetime.strptime('1950-01-31', '%Y-%m-%d').date()
+removedate22 = datetime.strptime('1964-12-31', '%Y-%m-%d').date()
+dates_to_remove1 = pd.date_range(start=removedate11, end=removedate22, freq='M')
+y_monthly_new = y_monthly_new.drop(dates_to_remove1, errors='ignore')
+y_quarterly_new = y_quarterly_new.drop(dates_to_remove1, errors='ignore')
+
+# Transform to numpy array so it is compatible with code format
+y_monthly = y_monthly_new.to_numpy()      # np.array(data['y_monthly'])
+y_quarterly = y_quarterly_new.to_numpy()  # np.array(data['y_quarterly'])
+
+# Standardize
+yy_monthly = (y_monthly - np.tile(np.nanmean(y_monthly, axis=0), (np.shape(y_monthly)[0], 1))) / np.tile(
+    np.nanstd(y_monthly, axis=0), (np.shape(y_monthly)[0], 1))
+yy_quarterly = (y_quarterly - np.tile(np.nanmean(y_quarterly, axis=0), (np.shape(y_quarterly)[0], 1))) / np.tile(
+    np.nanstd(y_quarterly, axis=0), (np.shape(y_quarterly)[0], 1))
+
+T, N_m = np.shape(yy_monthly)[0], np.shape(yy_monthly)[1]
+T_q, N_q = np.shape(yy_quarterly)[0], np.shape(yy_quarterly)[1]
+
+indexQuarter = np.zeros((T, 1))
+indexQuarter[np.arange(2, T, 3)] = 1  # 1 every 3 months, 0 otherwise
+
+startdate_macro = y_monthly_new.index[0]
+enddate_macro = y_monthly_new.index[-1]
+
+
+#### Get NBER recession data
+from fredapi import Fred
+fred = Fred(api_key='input_personal_api_key')
+
+rec_data_macro = fred.get_series('USREC', observation_start=startdate_macro, observation_end=enddate_macro)
+# Change format of index, so we can account for the covid data
+rec_data_macro.index = [pd.to_datetime(date, format='%Y-%m-%d').date() for date in rec_data_macro.index]
+rec_data_macro.index = pd.to_datetime(rec_data_macro.index)
+rec_data_macro = rec_data_macro.resample('M').last()  # move to last day so we can compare
+rec_data_macro = rec_data_macro.drop(dates_to_remove, errors='ignore')
+rec_data_macro = rec_data_macro.drop(dates_to_remove1, errors='ignore')
+NBERIndex = rec_data_macro.to_numpy()
+
+############################
+###    Specify priors    ###
+############################
+exec(open("specifyPriorsGibbsMacro.py").read())
+# priorsMacroGibbs dictionary is initialized here
+
+#### Initial values for the Gibbs Sampler:
+exec(open("initialValuesMacro.py").read())
+# param_macro_MH and param_macro_gibbs dictionaries are initialized here
+
+###########################
+###  The Gibbs Sampler  ###
+###########################
+
+N0 = 15000   # Burn-in: number of samples to leave out
+MM = 25000   # Number of samples to use
+CAPN = N0 + MM  # Total number of samples
+
+# Initialize empty objects to store parameter values
+Prob_tot = np.zeros((MM, (T - 3), 2))
+Common_component = np.zeros((MM, (T - 2), 3))
+State_specific = np.zeros((MM, T, 3))
+Gamma_tot = np.zeros((18, MM))
+PSI_tot = np.zeros((15, MM))
+SIG_tot = np.zeros((15, MM))
+MU_G_tot = np.zeros((2, MM))
+PHI_tot = np.zeros((18, MM))
+Sigma_X = np.zeros((2, MM))
+probState = np.zeros((2, MM))
+
+# To store computational times
+sims = []
+sims_cc = []
+sims_fltPR = []
+sims_gibbs_m = []
+sims_gibbs_q = []
+sims_macroparams = []
+sims_pq = []
+
+for Sim in range(0, CAPN):
+    simt0 = time.time()
+    print("Sim: ", Sim)
+
+    ### Draw Common Growth Component: generate_xt_sv
+    t0 = time.time()
+    loglh, z_t = generate_xt_sv(yy_monthly=yy_monthly, yy_quarterly=yy_quarterly, s_t=s_t,
+                                param_macro_MH=param_macro_MH, param_macro_gibbs=param_macro_gibbs,
+                                indexQuarter=indexQuarter)
+    t1 = time.time()
+    sims_cc.append(t1 - t0)
+    print("generate_xt_sv, time:", t1 - t0)
+    x_t = z_t[:, 0]  # the common component
+
+    # Draw states S_t: hamiltonfilter_xt_sv
+    t0 = time.time()
+    S_T, FLT_PR = HamiltonFilter_Replication(x_t=x_t, param_macro_MH=param_macro_MH)
+    t1 = time.time()
+    sims_fltPR.append(t1 - t0)
+    print("HamiltonFilter_Replication, time:", t1 - t0)
+    STT = np.vstack((np.zeros((3, 1), dtype=np.int32), S_T))
+    s_t = STT
+
+    # Draw Macro Parameters: update dictionary param_macro_gibbs
+    indexMonthly = 1
+
+    param_macro_gibbs_aux = {}
+    param_macro_gibbs_aux['gamma_macro'] = param_macro_gibbs['gamma_macro_m']
+    param_macro_gibbs_aux['psi_macro'] = param_macro_gibbs['psi_macro_m']
+    param_macro_gibbs_aux['SIG2_i_macro'] = param_macro_gibbs['SIG2_i_macro_m']
+
+    t0 = time.time()
+    gamma_macro, psi_macro, SIG2_i_macro = gibbsSamplingMacro(yy=yy_monthly[2:, ], x_t=x_t,
+                                                              param_macro_gibbs=param_macro_gibbs_aux,
+                                                              priorsMacroGibbs=priorsMacroGibbs,
+                                                              indexMonthly=indexMonthly)
+    t1 = time.time()
+    sims_gibbs_m.append(t1 - t0)
+    print("gibbsSamplingMacro, monthly, time:", t1 - t0)
+
+    param_macro_gibbs['gamma_macro_m'] = gamma_macro
+    param_macro_gibbs['psi_macro_m'] = psi_macro
+    param_macro_gibbs['SIG2_i_macro_m'] = SIG2_i_macro
+
+    gamma_macro_m = gamma_macro
+    psi_macro_m = psi_macro
+    SIG2_i_macro_m = SIG2_i_macro
+
+    indexMonthly = 0  # quarterly
+    param_macro_gibbs_aux.clear()  # clear dictionary
+    param_macro_gibbs_aux['gamma_macro'] = param_macro_gibbs['gamma_macro_q']
+    param_macro_gibbs_aux['psi_macro'] = param_macro_gibbs['psi_macro_q']
+    param_macro_gibbs_aux['SIG2_i_macro'] = param_macro_gibbs['SIG2_i_macro_q']
+
+    t0 = time.time()
+    gamma_macro, psi_macro, SIG2_i_macro = gibbsSamplingMacro(yy=yy_quarterly[2:, :], x_t=x_t,
+                                                              param_macro_gibbs=param_macro_gibbs_aux,
+                                                              priorsMacroGibbs=priorsMacroGibbs,
+                                                              indexMonthly=indexMonthly)
+    t1 = time.time()
+    sims_gibbs_q.append(t1 - t0)
+    print("gibbsSamplingMacro, quarterly, time:", t1 - t0)
+
+    param_macro_gibbs['gamma_macro_q'] = gamma_macro
+    param_macro_gibbs['psi_macro_q'] = psi_macro
+    param_macro_gibbs['SIG2_i_macro_q'] = SIG2_i_macro
+
+    gamma_macro_qrt = gamma_macro
+    psi_macro_qrt = psi_macro
+    SIG2_i_macro_qrt = SIG2_i_macro
+
+    gamma_macro = np.vstack((gamma_macro_m, gamma_macro_qrt))
+    psi_macro = np.vstack((psi_macro_m, psi_macro_qrt))
+    SIG2_i_macro = np.vstack((SIG2_i_macro_m, SIG2_i_macro_qrt))
+
+    param_macro_gibbs_aux.clear()
+
+    #### Draw common macro parameters: generate_MU_PHI_sv.m
+    D0_MU = 0
+    V0_MU = 0
+    t0 = time.time()
+    phi_cc, paramMU, Sigma2_0_cc, h_cc = generate_MU_PHI_sv(x_t, STT[2:], param_macro_MH, priorsMacroGibbs)
+    t1 = time.time()
+    sims_macroparams.append(t1 - t0)
+    print("generate_MU_PHI_sv, time:", t1 - t0)
+
+    # Update parameters
+    param_macro_MH["paramMU"] = paramMU
+    param_macro_MH["Sigma2_0_cc"] = Sigma2_0_cc
+    param_macro_MH["h_cc"] = h_cc
+    param_macro_MH["phi_cc"] = phi_cc
+
+    #### Draw p and q
+    t0 = time.time()
+    transition_matrix = generate_ChangeState(STT[4:(T - 1), 0], states)
+
+    A1TT = np.random.beta(transition_matrix[0, 1] + U1_01_, transition_matrix[0, 0] + U1_00_)  # 0 -> 1
+    B1TT = np.random.beta(transition_matrix[1, 0] + U1_10_, transition_matrix[1, 1] + U1_11_)  # 0 -> 1,
+
+    p = 1 - A1TT
+    q = 1 - B1TT
+    paramProb = np.asmatrix([A1TT, B1TT]).T
+    param_macro_MH['paramProb'] = paramProb
+
+    t1 = time.time()
+    sims_pq.append(t1 - t0)
+    print("generate p and q, time:", t1 - t0)
+
+    simt1 = time.time()
+    print("Full loop time:", simt1 - simt0)
+    sims.append(simt1 - simt0)
+
+    # Store parameter draws
+    if Sim >= N0:  # when burn-in period is over
+        State_specific[(Sim - N0), :, :] = e_t
+        Common_component[(Sim - N0), :, :] = z_t
+        probState[:, (Sim - N0)] = [p, q]
+        # trace['gamma'][(Sim - N0)] = np.squeeze(gamma_macro)
+        Gamma_tot[:, (Sim - N0)] = np.squeeze(gamma_macro)
+        PSI_tot[:, (Sim - N0)] = np.squeeze(psi_macro)
+        SIG_tot[:, (Sim - N0)] = np.squeeze(SIG2_i_macro)
+        MU_G_tot[:, (Sim - N0)] = np.squeeze(paramMU)
+        PHI_tot[:, (Sim - N0)] = phi_cc
+        Sigma_X[:, (Sim - N0)] = [Sigma2_0_cc, h_cc]
+        Prob_tot[(Sim - N0), :, :] = FLT_PR
+        # 3 dimensional matrix, each new "page" in the 3rd dimension represents new fprobs: FLT_PR
+
+
+
+
+
+######################################
+####    Data frame for export      ###
+######################################
+
+computation_time_df = pd.DataFrame({'full loop': sims,
+                                    'sims_cc': sims_cc,
+                                    'sims_fltPR': sims_fltPR,
+                                    'sims_gibbs_m': sims_gibbs_m,
+                                    'sims_gibbs_q': sims_gibbs_q,
+                                    'sims_macroparams': sims_macroparams,
+                                    'sims_pq': sims_pq})
+
+computation_time_df.to_csv(r'macro_computation_time_df_40000s.csv', index=True, header=True)
+
+
+dates = pd.date_range(start=startdate_macro, end=enddate_macro, freq='M').strftime('%Y-%m-%d')
+index = [pd.to_datetime(date, format='%Y-%m-%d').date() for date in dates if date not in dates_to_remove]
+
+# Make sure they have same lengths so export in same data frame is possible
+nan2 = np.asarray([np.nan, np.nan])
+nan3 = np.asarray([np.nan, np.nan, np.nan])
+
+CommonGrowth_median = np.concatenate((nan2, np.median(Common_component[:, :, 0], axis=0)))
+recession_prob_median = np.concatenate((nan3, np.median(Prob_tot[:, :, 0], axis=0)))
+CommonGrowth_mean = np.concatenate((nan2, np.mean(Common_component[:, :, 0], axis=0)))
+recession_prob_mean = np.concatenate((nan3, np.mean(Prob_tot[:, :, 0], axis=0)))
+
+df_export6522_fred = pd.DataFrame(index=index,
+                                  data={'Common_growth_component_median': CommonGrowth_median,
+                                        'Recession_prob_filtered_median': recession_prob_median,
+                                        'Common_growth_component_mean': CommonGrowth_mean,
+                                        'Recession_prob_filtered_mean': recession_prob_mean
+                                        })
+
+df_export6522_fred.to_csv(r'macro_6501_2209_fred_40000s.csv', index=True, header=True)
+
+
