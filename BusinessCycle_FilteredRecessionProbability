@@ -1,0 +1,154 @@
+import numpy as np
+
+def bingen(p0, p1, m: int):
+    """ Helper function. Returns either 0 or 1. Used for simulating states.
+    See Kim (1999) page 212 and 214 eq (9.16) for description.
+    """
+    pr0 = p0 / (p0 + p1)      # if vectors, then element-wise division
+    u = np.random.rand(m, m)  # m-by-m array of floats, uniformly distributed over [0, 1)
+    s = 1 - int(u < pr0)      # int() turns the boolean into 1 or 0
+    return s
+
+def generate_ChangeState(S_T, states):
+    """Helper function. Counts how many times we have transitioned from state i to state j.
+        states: tells the different state possibilities, fx [0, 1]
+        S_T: a vector of state realizations, fx. NBER recession data (0 or 1) """
+
+    n = len(S_T)
+    m = len(states)
+
+    changeState = np.zeros(shape=(m, m))  # mxm array of zeros
+
+    for t in range(1, n):
+        st1 = S_T[t - 1]
+        st = S_T[t]
+        changeState[st1, st] += 1
+    return changeState
+
+
+def HamiltonFilter_Replication(x_t: np.array, param_macro_MH: dict):
+    # Specify parameters to be used
+    paramMU = param_macro_MH['paramMU']
+    mu_0 = paramMU[0, 0]
+    mu_1 = paramMU[1, 0]
+    Sigma2_0_cc = param_macro_MH['Sigma2_0_cc']
+    h_cc = param_macro_MH['h_cc']
+    phi_cc = param_macro_MH['phi_cc']
+    paramProb = param_macro_MH['paramProb']
+
+    p = 1 - paramProb[0, 0]  # P[St=0 | St-1=0]
+    q = 1 - paramProb[1, 0]  # P[St=1 | St-1=1]
+
+    # Specify number of states to be considered
+    LAG_AR = 1
+    NO_ST = LAG_AR + 1
+    nDim = 2 ** NO_ST
+
+    # Different possible states, [S_{t-1}, S_t]
+    # If nb of states changes - change this
+    st_mat = np.asarray([[0, 0],
+                         [0, 1],
+                         [1, 0],
+                         [1, 1]])
+
+    Ystar = x_t[1:] - phi_cc * x_t[:-1]
+    Tstar = len(Ystar)
+
+    # Different possible values for mu and sigma 
+    mu_mat = np.multiply(mu_0, np.ones(np.shape(st_mat))) + np.multiply(st_mat, mu_1)  # shape should be 4x2
+    Sigma2_mat = np.multiply(Sigma2_0_cc, np.ones((np.shape(st_mat)[0], 1))) + Sigma2_0_cc * h_cc * st_mat[:, [-1]]  # shape should be 4x1
+    # A[:,-1] returns the last column
+
+    pr_tr = np.asarray([[p, 1 - q],
+                        [1 - p, q]])
+    pr_tr_vec = np.asmatrix(pr_tr.flatten('F')).T
+    # Flatten matrix to 4x1 vector
+    # Note: flatten returns a row vector, but we want a column vector
+    # Note: To transpose 1-dim arrays, convert to matrix, explanation: https://stackoverflow.com/questions/11885503/numpy-transpose-of-1d-array-not-giving-expected-result
+    
+    A = np.vstack((np.eye(2) - pr_tr, np.ones((1, 2))))
+    EN = np.asarray([[0], [0], [1]])
+
+    pr_ss = np.linalg.lstsq((A.T @ A), A.T @ EN, rcond=None)[0]
+    # Why there is rcond=None: https://stackoverflow.com/questions/29372559/what-is-the-difference-between-numpy-linalg-lstsq-and-scipy-linalg-lstsq
+
+    prob_0_aux = np.hstack((pr_ss, pr_ss)).T
+    prob_0 = np.asmatrix(prob_0_aux.flatten('F')).T
+    # Flatten matrix to vector (F=by columns, .T= as a column vector)
+
+    prob_1_vec = np.multiply(pr_tr_vec, prob_0)
+    # elementwise multiplication, note: not matrix multiplication
+
+    ################################
+    # the Hamilton Filter - Step 1 #
+    ################################
+    # Note: From Kim red book Chapter 9.1
+    # Kim (1999) page 213
+    # Step 1: Run Hamilton's (1989) basic filter to get g(S_t|tilde(y_t)), t=1,..,T and save them.
+    # The last iteration provides us with g(S_T|tilde(y_T)) from which S_T is generated
+    auxPhi = [[-phi_cc], [1]]  # 2x1
+    fprob = np.zeros(shape=(2, Tstar))  # shape should be 2 x Tstar
+
+    for t in range(0, Tstar):  # t = 0, 1, ..., Tstar-1
+        y_t = Ystar[t]
+        y_error = y_t * np.ones(shape=(nDim, 1)) - mu_mat @ auxPhi  # shape should be 4x1 vector
+        prob_dd = np.multiply(pr_tr_vec, prob_1_vec)  # shape should be 4x1
+
+        liki = np.multiply((1 / np.sqrt(2 * np.pi * Sigma2_mat)) * np.exp(-0.5 * (y_error ** 2) / Sigma2_mat), prob_dd)  # shape should be 4x1
+        # unnormalized posterier = likelihood * prior
+
+        liki_adj = liki / sum(liki)  # liki_adj should sum to 1
+        # normalized posterior = unnormalized posterior / sum(all unnormalized posterior)
+
+        prob_1 = liki_adj[0:(nDim // 2), 0] + liki_adj[(nDim // 2): int(nDim + 1), 0]
+        # Important: use // to return an int type value and not '/' for float
+        # 2x1: [ [liki_adj[0] + liki_adj[2]], [liki_adj[1] + liki_adj[3]] ]
+        # 2 cases going forward, S_t = 0 or S_t = 1, collect the adjusted probs
+
+        aux = np.hstack((prob_1, prob_1)).T
+        prob_1_vec = np.asmatrix(aux.flatten('F')).T
+
+        fprob[:, [t]] = prob_1  # save values
+
+    ### fprob_t = g(S_t|tilde(y_t)), t = 1,...,T
+    fprob = fprob.T  # shape: Tstar x 2: t=0,..,Tstar-1 runs downward now
+
+    ################################
+    ##   generate S_T - Step 2    ##
+    ################################
+
+    # Kim (1999) page 213
+    # Step 2: Generate S_t conditional on tilde(y)_t and S_{t+1}, t=T-1,T-2,...,1
+    # g(S_t |  tilde(y)_t, S_{t+1}) = ... = g(S_{t+1}|S_t)g(S_t|tilde(y)_t)
+    # g(S_{t+1}|S_t) is the transition probability
+    # g(S_t|tilde(y)_t) has been saved from step 1
+
+    # Initialize vector to be filled
+    S_T = np.zeros(shape=(Tstar, 1), dtype=np.int32)  # Tstarx1
+    # Important: why it must be int32 https://numpy.org/doc/stable/reference/generated/numpy.sum.html
+
+    p0 = fprob[-1, 0]  
+    p1 = fprob[-1, 1] 
+
+    # Compute S_{Tstar} (Last one)
+    S_T[-1] = bingen(p0, p1, m=1)   # Last position has index Tstar-1
+
+    # Thereafter, compute for t = Tstar-1, Tstar-2, ... , 1
+    # remember index of S_T starts at 0 and ends at Tstar-1, so loop runs from Tstar-2 down to zero
+    for i in range((Tstar - 2), -1, -1):  
+        if S_T[i + 1] == 0:  # i.e. if we were in recession previous period
+            p0 = p * fprob[i, 0]
+            p1 = (1 - q) * fprob[i, 1]
+            # p = [St=0 | St-1=0]: probability of staying in a recession
+
+        elif S_T[i + 1] == 1:
+            p0 = (1 - p) * fprob[i, 0]
+            p1 = q * fprob[i, 1]
+            # q = P[St=1 | S_{t-1} = 1]: probability of expansion given expansion
+
+        S_T[i] = bingen(p0, p1, m=1)
+
+    return S_T, fprob
+
+
+
